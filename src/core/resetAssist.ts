@@ -61,3 +61,54 @@ export function detectGdbServerKind(haystack: string): GdbServerKind {
 export function replyLooksUnsupported(reply: string): boolean {
     return /unknown (monitor )?command|unrecognized|invalid (command|argument|usage)|not supported|syntax error/i.test(reply);
 }
+
+/**
+ * The verification detail for a reset command the adapter did not know:
+ * says whether another method follows, so the last (or only) method never
+ * promises a "next" that is not coming.
+ */
+export function unsupportedResetDetail(method: ResetMethod, remaining: number): string {
+    return remaining > 0
+        ? `adapter did not recognize the ${method} reset command — trying the next method`
+        : `adapter did not recognize the ${method} reset command; no further method to try`;
+}
+
+/** What `resetTarget` found out, rendered by `renderResetOutcome`. */
+export interface ResetOutcomeView {
+    serverKind: GdbServerKind;
+    methodsTried: ResetMethod[];
+    commandsIssued: string[];
+    replies: string[];
+    verified: boolean;
+    verificationDetail: string;
+    /** True when the target was running and the tool halted it to issue the reset. */
+    haltedByUs: boolean;
+    /** True when the tool resumed the target afterwards (`halt: false` on a verified reset). */
+    resumed: boolean;
+}
+
+/**
+ * The `reset` tool's result text. Tells the truth about the end state: an
+ * unverified reset leaves the target halted — and says so, including that
+ * `halt: false` was not applied and whether the target was running before.
+ */
+export function renderResetOutcome(outcome: ResetOutcomeView, halt: boolean | undefined): string {
+    const commandsLine = outcome.commandsIssued.length > 0
+        ? ` Commands: ${outcome.commandsIssued.map(c => `'${c}'`).join(', ')} (server: ${outcome.serverKind}).`
+        : '';
+    if (outcome.verified) {
+        const next = outcome.resumed
+            ? ' Target resumed (halt=false).'
+            : ' Target is halted at the reset vector — use continue_execution to run.';
+        return `Target reset verified. ${outcome.verificationDetail}. ` +
+            `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine}${next}`;
+    }
+    const before = outcome.haltedByUs ? ' (it was running before the reset)' : '';
+    const notApplied = halt === false ? '; halt=false was not applied because the reset could not be verified' : '';
+    return `⚠️ Reset was issued but the target does NOT appear to have reset. ${outcome.verificationDetail}. ` +
+        `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine} ` +
+        `The target is halted${before}${notApplied} — use continue_execution to run. ` +
+        `'hardware' requires nSRST wired from probe to target — if it is not connected, no software reset can ` +
+        `recover this; power-cycle the board or reconnect the probe. ` +
+        `Adapter replies: ${outcome.replies.join(' | ') || '<none>'}`;
+}

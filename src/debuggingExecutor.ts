@@ -13,6 +13,7 @@ import {
 import {
     buildResetCommands, detectGdbServerKind, replyLooksUnsupported,
     GdbServerKind, ResetMethod,
+    unsupportedResetDetail,
 } from './core/resetAssist';
 import { DEMCR_TRCENA, DWT_ADDRESSES, DWT_CTRL_CYCCNTENA, DWT_CTRL_NOCYCCNT } from './core/dwt';
 import { logger } from './utils/logger';
@@ -90,7 +91,20 @@ export interface IDebuggingExecutor {
     getThreads(timeoutMs?: number): Promise<DapThread[]>;
     getCallStack(threadId?: number, levels?: number, timeoutMs?: number): Promise<StackFrame[]>;
     getVariablesForFrame(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any>;
+    /**
+     * Subscribe to the NEXT DAP `stopped` event of the active session. Call
+     * it *before* issuing continue / step / pause, so a stop that lands
+     * during the request's round trip is not missed. Unlike `waitForStop`
+     * it never answers "already stopped": the `continued` event of the
+     * request just sent may not have arrived yet.
+     */
+    armStopWaiter(timeoutMs: number): Promise<StopWaitResult>;
 }
+
+/** Threads whose top frame get_threads reads (the handler lists this many). */
+const TOP_FRAME_THREADS = 32;
+/** Concurrent stackTrace requests while doing so. */
+const TOP_FRAME_BATCH = 4;
 
 export interface DapThread {
     id: number;
@@ -114,6 +128,8 @@ export interface ResetOutcome {
     verificationDetail: string;
     /** True when the target was running and we halted it to issue the reset. */
     haltedByUs: boolean;
+    /** True when the target was resumed afterwards (`halt: false` on a verified reset). */
+    resumed: boolean;
 }
 
 /** Low-level diagnostics for telling a stale build / wrong-window apart from a genuine no-session. */
@@ -171,13 +187,6 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         config: vscode.DebugConfiguration
     ): Promise<boolean> {
         try {
-            if (config.type === 'coreclr') {
-                // Open the specific test file instead of the workspace folder
-                const testFileUri = vscode.Uri.file(config.program);
-                await vscode.commands.executeCommand('vscode.open', testFileUri);
-                vscode.commands.executeCommand('testing.debugCurrentFile');
-                return true;
-            }
             const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workingDirectory));
             return await vscode.debug.startDebugging(workspaceFolder, config);
         } catch (error) {
@@ -335,6 +344,12 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             // Fallback to UI command for non-timeout failures
             await vscode.commands.executeCommand('workbench.action.debug.pause');
         }
+    }
+
+    public armStopWaiter(timeoutMs: number): Promise<StopWaitResult> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        return waitForStopEvent(session, capTimeout(timeoutMs, HARD_CALL_CAP_MS));
     }
 
     /**
@@ -977,7 +992,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 for (let w = 0; w < wordCount; w++) {
                     const wordAddr = BigInt(addr) + BigInt(w * 4);
                     const hexAddr = `0x${wordAddr.toString(16)}`;
-                    const val = await this.evaluateMemoryWord(session, hexAddr, frameOpt);
+                    const val = await this.evaluateMemoryWord(session, hexAddr, dapMs, frameOpt);
                     // Little-endian: push 4 bytes
                     byteValues.push(val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >>> 24) & 0xFF);
                 }
@@ -1011,7 +1026,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         } catch (err) {
             if (err instanceof HardwareTimeoutError) { throw err; }
             // Fallback: GDB evaluate
-            return await this.evaluateMemoryWord(session, addr);
+            return await this.evaluateMemoryWord(session, addr, dapMs);
         }
     }
 
@@ -1022,6 +1037,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     private async evaluateMemoryWord(
         session: vscode.DebugSession,
         hexAddr: string,
+        dapMs: number,
         frameOpt?: Record<string, number>
     ): Promise<number> {
         if (!frameOpt) {
@@ -1035,7 +1051,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 expression: `*(unsigned int*)${hexAddr}`,
                 context: 'watch',
                 ...frameOpt,
-            }, this.timeouts.dapRequestMs);
+            }, dapMs);
             if (result?.result) {
                 const val = this.parseGdbIntResult(result.result);
                 if (val !== null) { return val; }
@@ -1051,7 +1067,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 expression: `-exec x/1xw ${hexAddr}`,
                 context: 'repl',
                 ...frameOpt,
-            }, this.timeouts.dapRequestMs);
+            }, dapMs);
             if (result?.result) {
                 // GDB x output: "0x20000000:\t0x12345678"
                 const match = result.result.match(/:\s*(0x[0-9a-fA-F]+)/);
@@ -1071,7 +1087,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 expression: `-exec print/x *(unsigned int*)${hexAddr}`,
                 context: 'repl',
                 ...frameOpt,
-            }, this.timeouts.dapRequestMs);
+            }, dapMs);
             if (result?.result) {
                 // GDB print output: "$1 = 0x12345678"
                 const match = result.result.match(/(0x[0-9a-fA-F]+)/);
@@ -1165,6 +1181,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             verified: false,
             verificationDetail: 'not attempted',
             haltedByUs: false,
+            resumed: false,
         };
 
         // A reset must be issued from a halted state — halt a running target first.
@@ -1182,7 +1199,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             ? ['system', 'core', 'hardware']
             : [options.method];
 
-        for (const method of methods) {
+        for (const [i, method] of methods.entries()) {
             outcome.methodsTried.push(method);
             // Always issue the halting form — the verification needs a stopped
             // snapshot; a 'run'-mode reset would race the PC read. The target
@@ -1196,7 +1213,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 if (replyLooksUnsupported(reply.raw)) { unsupported = true; }
             }
             if (unsupported) {
-                outcome.verificationDetail = `adapter did not recognize the ${method} reset command — trying the next method`;
+                outcome.verificationDetail = unsupportedResetDetail(method, methods.length - 1 - i);
                 continue;
             }
 
@@ -1217,8 +1234,11 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             }
         }
 
+        // An unverified target is in an unknown state: it stays halted and
+        // the result says so (see renderResetOutcome).
         if (outcome.verified && !leaveHalted) {
             await this.continue(dapMs);
+            outcome.resumed = true;
         }
         return outcome;
     }
@@ -1371,7 +1391,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         const debugState = await this.getCurrentDebugState(0);
         const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
         return withTimeout('readPeripheralRegister', overallMs, async () =>
-            readPeripheralViaMemory(session, peripheral, register, debugState.frameId)
+            readPeripheralViaMemory(session, peripheral, register, debugState.frameId, capTimeout(timeoutMs, this.timeouts.dapRequestMs))
         );
     }
 
@@ -1428,28 +1448,34 @@ export class DebuggingExecutor implements IDebuggingExecutor {
 
         const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
         const response = await customRequestWithTimeout<any>(session, 'threads', {}, dapMs);
-        const threads = response?.threads ?? [];
+        const threads: any[] = response?.threads ?? [];
 
-        const results: DapThread[] = await Promise.all(threads.map(async (t: any) => {
-            let topFrame: StackFrame | undefined;
-            try {
-                const st = await customRequestWithTimeout<any>(session, 'stackTrace', {
-                    threadId: t.id, startFrame: 0, levels: 1
-                }, dapMs);
-                const f = st?.stackFrames?.[0];
-                if (f) {
-                    topFrame = {
-                        name: f.name || 'unknown',
-                        source: f.source?.path || f.source?.name || undefined,
-                        line: f.line || undefined,
-                        column: f.column || undefined,
-                    };
+        // Top frames for the first TOP_FRAME_THREADS only (the handler lists
+        // that many), a few requests at a time: a GDB server serialises DAP
+        // requests, so one stackTrace per RTOS task fired at once made every
+        // one of them wait on the others and hit the deadline together.
+        const results: DapThread[] = threads.map(t => ({ id: t.id, name: t.name ?? `thread-${t.id}` }));
+        const withFrames = results.slice(0, TOP_FRAME_THREADS);
+        for (let i = 0; i < withFrames.length; i += TOP_FRAME_BATCH) {
+            await Promise.all(withFrames.slice(i, i + TOP_FRAME_BATCH).map(async (t) => {
+                try {
+                    const st = await customRequestWithTimeout<any>(session, 'stackTrace', {
+                        threadId: t.id, startFrame: 0, levels: 1
+                    }, dapMs);
+                    const f = st?.stackFrames?.[0];
+                    if (f) {
+                        t.topFrame = {
+                            name: f.name || 'unknown',
+                            source: f.source?.path || f.source?.name || undefined,
+                            line: f.line || undefined,
+                            column: f.column || undefined,
+                        };
+                    }
+                } catch {
+                    // best effort — leave topFrame undefined
                 }
-            } catch {
-                // best effort — leave topFrame undefined
-            }
-            return { id: t.id, name: t.name ?? `thread-${t.id}`, topFrame };
-        }));
+            }));
+        }
         return results;
     }
 

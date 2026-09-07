@@ -15,7 +15,10 @@
  */
 
 import * as assert from 'assert';
-import { parsePyocdLoadOutput } from '../core/flashController';
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+import { flashWithPyocd, parsePyocdLoadOutput } from '../core/flashController';
 
 /**
  * Test suite for pyOCD flash-output parsing. Strings mirror
@@ -75,5 +78,54 @@ suite('flashController parsePyocdLoadOutput', () => {
         assert.strictEqual(parsed.tail.length, 12);
         assert.strictEqual(parsed.tail[11], 'line 29');
         assert.strictEqual(parsed.tail[0], 'line 18');
+    });
+});
+
+suite('flashWithPyocd kill escalation', () => {
+    /** A child that answers `kill` the way `child_process` does, driven by the test. */
+    function fakeChild(onKill: (child: FakeChild, signal: NodeJS.Signals) => void) {
+        const child = Object.assign(new EventEmitter(), {
+            stdout: new PassThrough(), stderr: new PassThrough(),
+            exitCode: null as number | null, signalCode: null as NodeJS.Signals | null, killed: false,
+            signals: [] as NodeJS.Signals[],
+            kill(signal: NodeJS.Signals) { child.signals.push(signal); child.killed = true; onKill(child, signal); return true; },
+        });
+        return child;
+    }
+    type FakeChild = ReturnType<typeof fakeChild>;
+    const spawnFake = (child: FakeChild) => ((() => child) as unknown as typeof spawn);
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    test('a child that honours SIGTERM is not SIGKILLed', async () => {
+        const child = fakeChild((c, signal) => {
+            if (signal === 'SIGTERM') { c.signalCode = 'SIGTERM'; setImmediate(() => c.emit('close', null)); }
+        });
+        const result = await flashWithPyocd('x.cbuild-run.yml', 20, { spawn: spawnFake(child), killGraceMs: 30 });
+        assert.strictEqual(result.timedOut, true);
+        await sleep(80);
+        assert.deepStrictEqual(child.signals, ['SIGTERM']);
+    });
+
+    test('killed=true alone does not stop the escalation: a child still alive after SIGTERM is SIGKILLed', async () => {
+        // `killed` is set as soon as the signal is *sent* — the old guard checked exactly that.
+        const child = fakeChild((c, signal) => {
+            if (signal === 'SIGKILL') { c.signalCode = 'SIGKILL'; setImmediate(() => c.emit('close', null)); }
+        });
+        const result = await flashWithPyocd('x.cbuild-run.yml', 20, { spawn: spawnFake(child), killGraceMs: 30 });
+        assert.strictEqual(result.timedOut, true);
+        assert.strictEqual(result.exitCode, null);
+        assert.deepStrictEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+    });
+
+    test('a real process that ignores SIGTERM is killed after the grace period', async function () {
+        if (process.platform === 'win32') { this.skip(); }
+        const spawnIgnoring = ((_cmd: string, _args: string[], opts: object) =>
+            spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], opts as never)) as unknown as typeof spawn;
+        const t0 = Date.now();
+        const result = await flashWithPyocd('x.cbuild-run.yml', 200, { spawn: spawnIgnoring, killGraceMs: 300 });
+        const elapsed = Date.now() - t0;
+        assert.strictEqual(result.timedOut, true);
+        assert.strictEqual(result.exitCode, null, 'died by signal, not by exit');
+        assert.ok(elapsed >= 450 && elapsed < 5000, `elapsed ${elapsed} ms`);
     });
 });

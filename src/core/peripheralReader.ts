@@ -23,11 +23,11 @@ import { matchName } from './svdLookup.js';
 import { customRequestWithTimeout, HardwareTimeoutError } from '../utils/timeout.js';
 
 /**
- * Per-DAP-request timeout for peripheral reads. Matches the default
- * `cmsis-developer-assistant.dapRequestTimeoutMs` setting so a stalled probe cannot
- * hang peripheral dumps indefinitely.
+ * Per-DAP-request timeout for peripheral reads when the caller passes none —
+ * the default of `cmsis-developer-assistant.dapRequestTimeoutMs`. The
+ * executor passes the configured value (capped by the call's `timeoutMs`).
  */
-const PERIPHERAL_DAP_TIMEOUT_MS = 10000;
+const DEFAULT_DAP_TIMEOUT_MS = 10000;
 
 /**
  * Reads peripheral register values.
@@ -135,7 +135,8 @@ export async function readPeripheralViaMemory(
     session: vscode.DebugSession,
     peripheral: string,
     register?: string,
-    frameId?: number | null
+    frameId?: number | null,
+    dapTimeoutMs: number = DEFAULT_DAP_TIMEOUT_MS,
 ): Promise<string> {
     // Try SVD-based read
     const device = await loadSvd();
@@ -162,11 +163,11 @@ export async function readPeripheralViaMemory(
                 (suggestions.length ? ` Did you mean: ${suggestions.join(', ')}?` : '') +
                 `\nlookup_peripheral { name: '${svdPeriph.name}' } shows the register map without reading the target.\n`;
         }
-        return await readSingleRegister(session, svdPeriph, svdReg, frameId);
+        return await readSingleRegister(session, svdPeriph, svdReg, frameId, dapTimeoutMs);
     }
 
     // Read all registers of the peripheral
-    return await readAllRegisters(session, svdPeriph, frameId);
+    return await readAllRegisters(session, svdPeriph, frameId, dapTimeoutMs);
 }
 
 // ── SVD-based register reading ──────────────────────────────────
@@ -175,14 +176,15 @@ async function readSingleRegister(
     session: vscode.DebugSession,
     peripheral: SvdPeripheral,
     reg: SvdRegister,
-    frameId?: number | null
+    frameId: number | null | undefined,
+    dapTimeoutMs: number,
 ): Promise<string> {
     const addr = peripheral.baseAddress + reg.addressOffset;
     const hexAddr = `0x${addr.toString(16).padStart(8, '0')}`;
 
     let value: number;
     try {
-        value = await readWord(session, hexAddr, frameId);
+        value = await readWord(session, hexAddr, frameId, dapTimeoutMs);
     } catch (e) {
         return `${peripheral.name}.${reg.name} @ ${hexAddr}: <read failed: ${e}>`;
     }
@@ -215,7 +217,8 @@ async function readSingleRegister(
 async function readAllRegisters(
     session: vscode.DebugSession,
     peripheral: SvdPeripheral,
-    frameId?: number | null
+    frameId: number | null | undefined,
+    dapTimeoutMs: number,
 ): Promise<string> {
     const regs = peripheral.registers;
     if (regs.length === 0) {
@@ -237,7 +240,7 @@ async function readAllRegisters(
 
         let valStr: string;
         try {
-            const value = await readWord(session, hexAddr, frameId);
+            const value = await readWord(session, hexAddr, frameId, dapTimeoutMs);
             valStr = `0x${(value >>> 0).toString(16).padStart(8, '0')}`;
         } catch {
             valStr = '<read failed>';
@@ -255,17 +258,18 @@ async function readAllRegisters(
 
 // ── Memory read helper ──────────────────────────────────────────
 
-async function readWord(
+export async function readWord(
     session: vscode.DebugSession,
     hexAddr: string,
-    frameId?: number | null
+    frameId: number | null | undefined,
+    dapTimeoutMs: number = DEFAULT_DAP_TIMEOUT_MS,
 ): Promise<number> {
     // Try DAP readMemory first
     try {
         const response = await customRequestWithTimeout<any>(session, 'readMemory', {
             memoryReference: hexAddr,
             count: 4,
-        }, PERIPHERAL_DAP_TIMEOUT_MS);
+        }, dapTimeoutMs);
         if (response?.data) {
             const buf = Buffer.from(response.data, 'base64');
             return buf.readUInt32LE(0);
@@ -283,7 +287,7 @@ async function readWord(
             expression: `*(unsigned int*)${hexAddr}`,
             context: 'watch',
             ...frameOpt,
-        }, PERIPHERAL_DAP_TIMEOUT_MS);
+        }, dapTimeoutMs);
         if (result?.result) {
             const val = parseGdbInt(result.result);
             if (val !== null) { return val; }
@@ -299,7 +303,7 @@ async function readWord(
             expression: `-exec x/1xw ${hexAddr}`,
             context: 'repl',
             ...frameOpt,
-        }, PERIPHERAL_DAP_TIMEOUT_MS);
+        }, dapTimeoutMs);
         if (result?.result) {
             const match = result.result.match(/:\s*(0x[0-9a-fA-F]+)/);
             if (match) {

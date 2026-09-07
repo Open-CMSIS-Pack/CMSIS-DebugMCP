@@ -109,14 +109,20 @@ export async function probePyocd(timeoutMs = 5_000): Promise<string | null> {
  * SIGTERMed at the deadline (SIGKILL 2 s later) so a wedged probe cannot
  * hang the tool call.
  */
-export async function flashWithPyocd(cbuildRunFile: string, timeoutMs: number): Promise<FlashResult> {
+export async function flashWithPyocd(
+    cbuildRunFile: string,
+    timeoutMs: number,
+    deps: { spawn?: typeof spawn; killGraceMs?: number } = {},
+): Promise<FlashResult> {
     const args = ['load', '--cbuild-run', cbuildRunFile];
     const commandLine = `pyocd ${args.join(' ')}`;
+    const spawnFn = deps.spawn ?? spawn;
+    const killGraceMs = deps.killGraceMs ?? 2_000;
     return new Promise((resolve) => {
         let stdout = '';
         let stderr = '';
         let timedOut = false;
-        const child = spawn('pyocd', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawnFn('pyocd', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
         // Cap captured output so a chatty run cannot grow unbounded.
         const CAP = 256 * 1024;
@@ -126,7 +132,11 @@ export async function flashWithPyocd(cbuildRunFile: string, timeoutMs: number): 
         const killTimer = setTimeout(() => {
             timedOut = true;
             child.kill('SIGTERM');
-            setTimeout(() => { if (!child.killed) { child.kill('SIGKILL'); } }, 2_000).unref();
+            // `child.killed` is true as soon as the SIGTERM was *sent*; only
+            // exitCode / signalCode say whether the process actually died.
+            setTimeout(() => {
+                if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); }
+            }, killGraceMs).unref();
         }, timeoutMs);
 
         const finish = (exitCode: number | null) => {

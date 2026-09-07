@@ -2,8 +2,11 @@
 // Copyright 2026 Arm Limited and contributors
 
 import * as assert from 'assert';
-import { formatBreakpointModifiers } from '../debugState';
-import { DebuggingHandler } from '../debuggingHandler';
+import { DebugState, formatBreakpointModifiers } from '../debugState';
+import { DebuggingHandler, probeSchedule } from '../debuggingHandler';
+import { IDebuggingExecutor } from '../debuggingExecutor';
+import { IDebugConfigurationManager } from '../utils/debugConfigurationManager';
+import { StopWaitResult } from '../utils/sessionStateTracker';
 
 /**
  * Logpoint message translation: VS Code's `{expr}` syntax has to become a GDB
@@ -115,5 +118,110 @@ suite('Breakpoint modifier formatting', () => {
 
     test('an absent enabled flag is not reported as disabled', () => {
         assert.strictEqual(formatBreakpointModifiers({}), '');
+    });
+});
+
+/**
+ * Continue / step / pause wait for the DAP `stopped` event, armed before the
+ * request goes out. The executor is a stub that records the order of calls
+ * and hands out scripted stop outcomes.
+ */
+suite('Execution commands wait for the DAP stopped event', () => {
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    let calls: string[];
+    let waiters: Promise<StopWaitResult>[];
+    const stopped = (reason: string): Promise<StopWaitResult> => Promise.resolve({ kind: 'stopped', reason, threadId: 1 });
+    const never = (): Promise<StopWaitResult> => new Promise(() => { /* pending forever */ });
+
+    function makeHandler(): DebuggingHandler {
+        const state = new DebugState();
+        state.sessionActive = true;
+        state.fileName = 'main.c';
+        state.fileFullPath = '/w/main.c';
+        state.currentLine = 42;
+        state.frameName = 'main';
+        const record = (name: string) => async () => { calls.push(name); };
+        const fake = {
+            hasDebugSession: () => true,
+            hasActiveSession: async () => true,
+            getSessionStatus: async () => ({ state: 'running' as const }),
+            continue: record('continue'),
+            stepOver: record('stepOver'),
+            stepInto: record('stepInto'),
+            stepOut: record('stepOut'),
+            pause: record('pause'),
+            armStopWaiter: () => {
+                calls.push('arm');
+                const next = waiters.shift();
+                if (!next) { throw new Error('test scripted no waiter'); }
+                return next;
+            },
+            getCurrentDebugState: async () => state,
+            readCoreRegisters: async () => ({ pc: '0x08000100', lr: '0x08000200' }),
+        };
+        return new DebuggingHandler(fake as unknown as IDebuggingExecutor, {} as IDebugConfigurationManager, 5);
+    }
+
+    setup(() => { calls = []; waiters = []; });
+
+    test('the waiter is armed before continue is sent, and the stop reason is reported', async () => {
+        waiters = [stopped('breakpoint')];
+        const result = await makeHandler().handleContinue();
+        assert.deepStrictEqual(calls, ['arm', 'continue']);
+        assert.match(result, /^Target stopped \(reason: breakpoint\)\./);
+        assert.match(result, /main\.c/);
+        assert.match(result, /42/);
+    });
+
+    for (const [method, op] of [['handleStepOver', 'stepOver'], ['handleStepInto', 'stepInto'], ['handleStepOut', 'stepOut']] as const) {
+        test(`${method} arms the waiter before the request`, async () => {
+            waiters = [stopped('step')];
+            const result = await makeHandler()[method]();
+            assert.deepStrictEqual(calls, ['arm', op]);
+            assert.match(result, /reason: step/);
+        });
+    }
+
+    test('a cleared stack item cannot settle the wait — only a stop event does', async () => {
+        // The old implementation settled on vscode.debug.onDidChangeActiveStackItem, which also
+        // fires when the item is cleared on resume. With no stop event the call must keep waiting.
+        waiters = [never()];
+        const outcome = await Promise.race([makeHandler().handleContinue().then(() => 'settled'), sleep(100).then(() => 'still waiting')]);
+        assert.strictEqual(outcome, 'still waiting');
+    });
+
+    test('no stop within the timeout is reported as a timeout, then recovery arms again before pausing', async () => {
+        waiters = [Promise.resolve({ kind: 'timeout' }), stopped('pause')];
+        const result = await makeHandler().handleContinue();
+        assert.deepStrictEqual(calls, ['arm', 'continue', 'arm', 'pause'], 'arm precedes each request');
+        assert.match(result, /'continue_execution' did not complete within 5s/);
+        assert.match(result, /Recovery attempt/);
+        assert.match(result, /Paused successfully\. PC = 0x08000100, LR = 0x08000200 in main at main\.c:42\./);
+    });
+
+    test('a session that ends during continue is reported as such', async () => {
+        waiters = [Promise.resolve({ kind: 'ended' })];
+        const result = await makeHandler().handleContinue();
+        assert.match(result, /Debug session ended during 'continue_execution'/);
+    });
+
+    test('pause_execution arms the waiter before the pause request', async () => {
+        waiters = [stopped('pause')];
+        const result = await makeHandler().handlePause();
+        assert.deepStrictEqual(calls, ['arm', 'pause']);
+        assert.match(result, /^Target paused\./);
+    });
+});
+
+suite('cmsis_action session-survival probe schedule', () => {
+    test('delays and probes fit the budget, probes cap at 5 s', () => {
+        for (const budget of [1_000, 4_000, 8_000, 16_000, 60_000]) {
+            const p = probeSchedule(budget);
+            assert.ok(p.firstDelayMs + p.probeMs + p.secondDelayMs + p.probeMs <= budget, `budget ${budget}: ${JSON.stringify(p)}`);
+            assert.ok(p.probeMs <= 5_000 && p.probeMs >= 250, JSON.stringify(p));
+            assert.ok(p.firstDelayMs > 0 && p.secondDelayMs >= 0);
+        }
+        assert.deepStrictEqual(probeSchedule(8_000), { firstDelayMs: 2800, secondDelayMs: 1200, probeMs: 2000 });
+        assert.deepStrictEqual(probeSchedule(0), probeSchedule(1_000), 'a degenerate budget is raised to a second');
     });
 });

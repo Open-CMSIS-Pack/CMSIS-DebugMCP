@@ -15,7 +15,7 @@
  */
 
 import * as assert from 'assert';
-import { buildResetCommands, detectGdbServerKind, replyLooksUnsupported } from '../core/resetAssist';
+import { ResetOutcomeView, buildResetCommands, detectGdbServerKind, renderResetOutcome, replyLooksUnsupported, unsupportedResetDetail } from '../core/resetAssist';
 
 /**
  * Test suite for the pure reset-command mapping (server kind × method × halt).
@@ -54,5 +54,33 @@ suite('resetAssist', () => {
         assert.strictEqual(replyLooksUnsupported('Error: command not supported'), true);
         assert.strictEqual(replyLooksUnsupported('Resetting target'), false);
         assert.strictEqual(replyLooksUnsupported(''), false);
+    });
+});
+
+suite('resetAssist outcome rendering', () => {
+    const base: ResetOutcomeView = {
+        serverKind: 'pyocd', methodsTried: ['system'], commandsIssued: ['monitor reset halt system'], replies: ['ok'],
+        verified: false, verificationDetail: 'PC 0x08000400 is not the reset handler 0x080001c1', haltedByUs: false, resumed: false,
+    };
+
+    test('the last (or only) unsupported method does not promise a next one', () => {
+        assert.match(unsupportedResetDetail('system', 2), /trying the next method/);
+        assert.match(unsupportedResetDetail('hardware', 0), /no further method to try/);
+        assert.doesNotMatch(unsupportedResetDetail('hardware', 0), /next method/);
+    });
+
+    test('an unverified reset says the target is halted, that halt=false was not applied, and whether it was running before', () => {
+        const text = renderResetOutcome({ ...base, haltedByUs: true }, false);
+        assert.match(text, /does NOT appear to have reset/);
+        assert.match(text, /The target is halted \(it was running before the reset\); halt=false was not applied because the reset could not be verified — use continue_execution to run\./);
+        assert.match(text, /Commands: 'monitor reset halt system' \(server: pyocd\)/);
+        const plain = renderResetOutcome(base, undefined);
+        assert.match(plain, /The target is halted — use continue_execution to run\./);
+        assert.doesNotMatch(plain, /halt=false/);
+    });
+
+    test('a verified reset reports resumed only when the target was actually resumed', () => {
+        assert.match(renderResetOutcome({ ...base, verified: true, resumed: true }, false), /^Target reset verified\..*Target resumed \(halt=false\)\./);
+        assert.match(renderResetOutcome({ ...base, verified: true }, undefined), /halted at the reset vector — use continue_execution to run/);
     });
 });

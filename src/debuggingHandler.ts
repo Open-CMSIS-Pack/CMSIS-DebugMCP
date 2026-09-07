@@ -14,6 +14,7 @@ import { DebugState, formatBreakpointModifiers, StackFrame } from './debugState'
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
 import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
+import { renderResetOutcome } from './core/resetAssist';
 import { redactExpressionResult, redactVariableValue, REDACTION_NOTICE } from './utils/secretRedaction';
 import {
     DapScope,
@@ -127,6 +128,28 @@ export type CmsisAction =
 /**
  * Handles debugging operations using the executor and configuration manager
  */
+/**
+ * When `confirmSessionSurvives` probes, given the window it may use: the
+ * probes start at 35 % and 75 % of the budget and each may take a quarter
+ * of it (at most 5 s), so delays + probes never exceed the budget.
+ */
+export function probeSchedule(budgetMs: number): { firstDelayMs: number; secondDelayMs: number; probeMs: number } {
+    const budget = Math.max(budgetMs, 1_000);
+    const probeMs = Math.min(5_000, Math.floor(budget / 4));
+    const firstDelayMs = Math.floor(budget * 0.35);
+    const secondDelayMs = Math.max(0, Math.floor(budget * 0.75) - firstDelayMs - probeMs);
+    return { firstDelayMs, secondDelayMs, probeMs };
+}
+
+/** What a continue / step / pause produced, for the result message. */
+interface ExecutionOutcome {
+    state: DebugState;
+    timedOut: boolean;
+    sessionEnded: boolean;
+    /** The DAP stop reason (`breakpoint`, `step`, `pause`, `exception` …) when the target stopped. */
+    reason: string | null;
+}
+
 export class DebuggingHandler implements IDebuggingHandler {
     private readonly numNextLines: number = 3;
 
@@ -380,8 +403,7 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleStepOver(args?: { timeoutMs?: number }): Promise<string> {
         try {
             await this.ensureStoppedSession('step over');
-            await this.executor.stepOver(args?.timeoutMs);
-            const result = await this.waitForTargetStopped(args?.timeoutMs);
+            const result = await this.issueAndWaitForStop(() => this.executor.stepOver(args?.timeoutMs), args?.timeoutMs);
             return await this.formatAfterExecutionWithHeal(result, 'step_over');
         } catch (error) {
             throw new Error(`Error executing step over: ${error}`);
@@ -394,8 +416,7 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleStepInto(args?: { timeoutMs?: number }): Promise<string> {
         try {
             await this.ensureStoppedSession('step into');
-            await this.executor.stepInto(args?.timeoutMs);
-            const result = await this.waitForTargetStopped(args?.timeoutMs);
+            const result = await this.issueAndWaitForStop(() => this.executor.stepInto(args?.timeoutMs), args?.timeoutMs);
             return await this.formatAfterExecutionWithHeal(result, 'step_into');
         } catch (error) {
             throw new Error(`Error executing step into: ${error}`);
@@ -408,8 +429,7 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleStepOut(args?: { timeoutMs?: number }): Promise<string> {
         try {
             await this.ensureStoppedSession('step out');
-            await this.executor.stepOut(args?.timeoutMs);
-            const result = await this.waitForTargetStopped(args?.timeoutMs);
+            const result = await this.issueAndWaitForStop(() => this.executor.stepOut(args?.timeoutMs), args?.timeoutMs);
             return await this.formatAfterExecutionWithHeal(result, 'step_out');
         } catch (error) {
             throw new Error(`Error executing step out: ${error}`);
@@ -422,8 +442,7 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleContinue(args?: { timeoutMs?: number }): Promise<string> {
         try {
             await this.ensureStoppedSession('continue execution');
-            await this.executor.continue(args?.timeoutMs);
-            const result = await this.waitForTargetStopped(args?.timeoutMs);
+            const result = await this.issueAndWaitForStop(() => this.executor.continue(args?.timeoutMs), args?.timeoutMs);
             return await this.formatAfterExecutionWithHeal(result, 'continue_execution');
         } catch (error) {
             throw new Error(`Error executing continue: ${error}`);
@@ -435,10 +454,7 @@ export class DebuggingHandler implements IDebuggingHandler {
      * step on timeout: pause the running target, then report where its PC
      * actually is. Saves the agent a round-trip when the breakpoint wasn't hit.
      */
-    private async formatAfterExecutionWithHeal(
-        result: { state: DebugState; timedOut: boolean; sessionEnded: boolean },
-        op: string
-    ): Promise<string> {
+    private async formatAfterExecutionWithHeal(result: ExecutionOutcome, op: string): Promise<string> {
         const base = this.formatAfterExecution(result, op);
         if (!result.timedOut || result.sessionEnded) {
             return base;
@@ -470,9 +486,8 @@ export class DebuggingHandler implements IDebuggingHandler {
             return `Cannot pause yet: session is still initializing. Wait briefly and retry.`;
         }
 
-        // state === 'running' — issue the pause and wait for stop
-        await this.executor.pause(args?.timeoutMs);
-        const result = await this.waitForTargetStopped(args?.timeoutMs);
+        // state === 'running' — arm the stop waiter, issue the pause, wait
+        const result = await this.issueAndWaitForStop(() => this.executor.pause(args?.timeoutMs), args?.timeoutMs);
         if (result.timedOut) {
             return `Pause requested but target did not stop within the timeout. ` +
                 `Probe may be unresponsive — call get_session_status / check_target_connection.`;
@@ -512,7 +527,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                     'disconnected, or the session was stopped in the UI. Call get_session_status to confirm.';
             }
             // Let VS Code surface the new frame before snapshotting (same
-            // settle delay waitForTargetStopped uses).
+            // settle delay the stop wait used to need).
             await new Promise(resolve => setTimeout(resolve, this.executionDelay));
             const state = await this.executor.getCurrentDebugState(this.numNextLines);
             const threadInfo = result.kind === 'stopped' && result.threadId !== null ? `, threadId=${result.threadId}` : '';
@@ -570,21 +585,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 halt: args?.halt,
                 timeoutMs: args?.timeoutMs,
             });
-            const commandsLine = outcome.commandsIssued.length > 0
-                ? ` Commands: ${outcome.commandsIssued.map(c => `'${c}'`).join(', ')} (server: ${outcome.serverKind}).`
-                : '';
-            if (outcome.verified) {
-                const next = args?.halt === false
-                    ? ' Target resumed (halt=false).'
-                    : ' Target is halted at the reset vector — use continue_execution to run.';
-                return `Target reset verified. ${outcome.verificationDetail}. ` +
-                    `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine}${next}`;
-            }
-            return `⚠️ Reset was issued but the target does NOT appear to have reset. ${outcome.verificationDetail}. ` +
-                `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine} ` +
-                `'hardware' requires nSRST wired from probe to target — if it is not connected, no software reset can ` +
-                `recover this; power-cycle the board or reconnect the probe. ` +
-                `Adapter replies: ${outcome.replies.join(' | ') || '<none>'}`;
+            return renderResetOutcome(outcome, args?.halt);
         });
     }
 
@@ -1132,63 +1133,55 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
-     * Wait for the target to stop after a continue/step command.
-     * Uses vscode.debug.onDidChangeActiveStackItem which fires when the debugger
-     * stops and a stack frame becomes available — safe for embedded targets.
+     * Arm the DAP-stopped waiter, issue an execution request, and wait for
+     * the target to stop — the same `stopped` event `wait_for_stop` and
+     * `reset` rely on, armed *before* the request so a stop that lands
+     * during the round trip is not missed.
      *
-     * Returns both the state snapshot and whether the wait timed out so that
-     * callers can report a clear "target still running / probe stalled" message
-     * instead of silently returning a stale state.
+     * This used to listen for `vscode.debug.onDidChangeActiveStackItem`,
+     * which also fires when VS Code *clears* the item on resume; the
+     * `continued` event of the request just sent usually arrived after the
+     * listener was attached, and the tool reported "stopped" with an empty
+     * location while the target was running.
+     *
+     * Returns the state snapshot plus whether the wait timed out or the
+     * session ended, so callers can report a clear "target still running /
+     * probe stalled" message instead of a stale state.
      */
-    private async waitForTargetStopped(overrideMs?: number): Promise<{ state: DebugState; timedOut: boolean; sessionEnded: boolean }> {
-        return new Promise((resolve) => {
-            const cap = 60_000;
-            const def = this.timeoutInSeconds * 1000;
-            const timeoutMs = (overrideMs && overrideMs > 0) ? Math.min(overrideMs, cap) : Math.min(def, cap);
-            let settled = false;
-            let sessionEnded = false;
-            let timedOut = false;
-
-            const settle = async () => {
-                if (settled) { return; }
-                settled = true;
-                stackDisposable.dispose();
-                sessionDisposable.dispose();
-                clearTimeout(timer);
-                // No settle delay needed: getCurrentDebugState reads the location
-                // from the DAP top stack frame, which is already correct at this
-                // point. It used to scrape the editor cursor, which VS Code
-                // updates asynchronously — hence the old 300 ms sleep here.
-                const state = await this.executor.getCurrentDebugState(this.numNextLines);
-                resolve({ state, timedOut, sessionEnded });
-            };
-
-            // Listen for when a stack frame becomes active (= target stopped)
-            const stackDisposable = vscode.debug.onDidChangeActiveStackItem(() => {
-                settle();
-            });
-
-            // Also listen for session termination
-            const sessionDisposable = vscode.debug.onDidTerminateDebugSession(() => {
-                sessionEnded = true;
-                settle();
-            });
-
-            // Timeout fallback
-            const timer = setTimeout(() => {
-                timedOut = true;
-                logger.warn(`waitForTargetStopped: target did not stop within ${timeoutMs}ms`);
-                settle();
-            }, timeoutMs);
-        });
+    private async issueAndWaitForStop(issue: () => Promise<void>, overrideMs?: number): Promise<ExecutionOutcome> {
+        const cap = 60_000;
+        const def = this.timeoutInSeconds * 1000;
+        const timeoutMs = (overrideMs && overrideMs > 0) ? Math.min(overrideMs, cap) : Math.min(def, cap);
+        // Armed first. If `issue` throws, the waiter times out on its own
+        // (≤ 60 s) and removes itself — nothing else observes it.
+        const pending = this.executor.armStopWaiter(timeoutMs);
+        await issue();
+        const outcome = await pending;
+        if (outcome.kind === 'timeout') {
+            logger.warn(`issueAndWaitForStop: target did not stop within ${timeoutMs}ms`);
+        }
+        // The location comes from the DAP top stack frame, which is already
+        // correct at this point; a failed read (session gone) is an empty state.
+        let state: DebugState;
+        try {
+            state = await this.executor.getCurrentDebugState(this.numNextLines);
+        } catch {
+            state = new DebugState();
+        }
+        return {
+            state,
+            timedOut: outcome.kind === 'timeout',
+            sessionEnded: outcome.kind === 'ended',
+            reason: outcome.kind === 'stopped' ? outcome.reason : null,
+        };
     }
 
     /**
      * Format the result of a step/continue command, annotating timeouts and
      * session termination so the MCP client sees an unambiguous outcome.
      */
-    private formatAfterExecution(result: { state: DebugState; timedOut: boolean; sessionEnded: boolean }, op: string): string {
-        const body = this.compactState(result.state);
+    private formatAfterExecution(result: ExecutionOutcome, op: string): string {
+        const body = result.reason ? `Target stopped (reason: ${result.reason}).\n\n${this.compactState(result.state)}` : this.compactState(result.state);
         if (result.sessionEnded) {
             return `${body}\n\n⚠️ Debug session ended during '${op}'. The target may have run to completion, crashed, or lost its connection.`;
         }
@@ -1214,9 +1207,7 @@ export class DebuggingHandler implements IDebuggingHandler {
         lines.push(`\n🩹 Recovery attempt: target did not stop on its own — issuing DAP pause to find out where it is.`);
         try {
             // Short timeout for the pause itself; we don't want to compound the wait.
-            await this.executor.pause(5_000);
-            // Wait for the stop event to propagate.
-            const recovered = await this.waitForTargetStopped(5_000);
+            const recovered = await this.issueAndWaitForStop(() => this.executor.pause(5_000), 5_000);
             if (recovered.sessionEnded) {
                 lines.push(`Pause issued but the debug session ended. The target may have crashed during '${op}'.`);
                 return lines.join('\n');
@@ -1877,7 +1868,8 @@ REQUIRED NEXT STEPS:
      * `running`/`stopped`. A doomed session has collapsed to `no-session` by
      * the second probe. We never assert "stable" off a single observation.
      */
-    private async confirmSessionSurvives(): Promise<{ stable: boolean; detail: string }> {
+    private async confirmSessionSurvives(budgetMs: number): Promise<{ stable: boolean; detail: string }> {
+        const plan = probeSchedule(budgetMs);
         // A zombie gdbtarget session — adapter process alive, GDB NOT connected
         // to a target — keeps the VS Code session object around for several
         // seconds and even answers a shallow DAP `threads` ping. But it
@@ -1890,7 +1882,7 @@ REQUIRED NEXT STEPS:
                 return { ok: false, detail: `${label}: no session object` };
             }
             try {
-                const threads = await this.executor.getThreads(5_000);
+                const threads = await this.executor.getThreads(plan.probeMs);
                 if (threads.length >= 1) {
                     return { ok: true, detail: `${label}: ${threads.length} thread(s)` };
                 }
@@ -1900,14 +1892,15 @@ REQUIRED NEXT STEPS:
             }
         };
 
-        // Let the connect settle, then probe.
-        await new Promise(r => setTimeout(r, 3_000));
-        const first = await probe('t+3s');
+        // Let the connect settle, then probe — at 35 % and 75 % of the
+        // budget, so the whole check fits the window the caller advertised.
+        await new Promise(r => setTimeout(r, plan.firstDelayMs));
+        const first = await probe(`t+${Math.round(plan.firstDelayMs / 1000)}s`);
         // Second probe after a gap. The LATER probe is decisive: a real
-        // session is fully connected (threads populated) by t+6s; a zombie is
+        // session is fully connected (threads populated) by then; a zombie is
         // gone or still thread-less.
-        await new Promise(r => setTimeout(r, 3_000));
-        const second = await probe('t+6s');
+        await new Promise(r => setTimeout(r, plan.secondDelayMs));
+        const second = await probe(`t+${Math.round((plan.firstDelayMs + plan.probeMs + plan.secondDelayMs) / 1000)}s`);
         if (second.ok) {
             return { stable: true, detail: `${first.detail}, ${second.detail} — target threads present` };
         }
@@ -2157,7 +2150,7 @@ REQUIRED NEXT STEPS:
                     // DAP `threads` ping for a few seconds, then collapses.
                     // Probe at two time points spaced apart — a doomed session
                     // is gone by the second check.
-                    const survived = await this.confirmSessionSurvives();
+                    const survived = await this.confirmSessionSurvives(opportunisticMs);
                     if (survived.stable) {
                         const state = await this.executor.getCurrentDebugState(this.numNextLines);
                         return `CMSIS '${args.action}' completed${targetTag} — debug session survived the connect ` +

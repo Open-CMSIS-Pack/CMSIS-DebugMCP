@@ -65,9 +65,9 @@ When debugging stops, the handler prompts AI agents to consider whether they fou
 
 - Class definition: `src/debuggingHandler.ts`
 - Interface: `IDebuggingHandler`
-- State change detection: `waitForStateChange()`, `hasStateChanged()`
-- Session waiting: `waitForActiveDebugSession()`
-- State formatting: `formatDebugState()`
+- Execution requests: `issueAndWaitForStop()` — arms the DAP `stopped` waiter (`waitForStopEvent` in `src/utils/sessionStateTracker.ts`) *before* sending continue / step / pause, so a stop that lands during the round trip is not missed; the result names the stop reason
+- Session waiting: `waitForActiveDebugSession()`, `confirmSessionSurvives()` (probes scheduled by `probeSchedule()` inside the advertised window)
+- State formatting: `formatAfterExecution()`, `compactState()`
 
 ## Design Patterns
 
