@@ -88,23 +88,28 @@ export class ControlServer {
             if (refused) { return; } // drained, not buffered
             size += chunk.length;
             if (size > CONTROL_REQUEST_MAX_BYTES) {
-                // Answer at once and keep draining: destroying the socket
-                // while the client is still writing resets the connection
-                // (ECONNRESET on Windows) before the 413 is read.
+                // Stop buffering, keep draining, answer 413 once the body
+                // has ended: destroying the socket — or closing it right
+                // after an early answer — while the client is still writing
+                // resets the connection (ECONNRESET on Windows) before the
+                // answer is read. The channel is loopback and the MCP side
+                // caps requests at the same size, so the drain is bounded.
                 refused = true;
                 chunks.length = 0;
-                res.writeHead(413, { 'Content-Type': 'application/json', 'Connection': 'close' });
-                res.end(JSON.stringify({ error: `control request above ${CONTROL_REQUEST_MAX_BYTES} bytes` }));
-                return;
+            } else {
+                chunks.push(chunk);
             }
-            chunks.push(chunk);
         });
         req.on('error', (err) => {
             logger.warn(`Control request aborted: ${err.message}`);
             if (!res.headersSent) { res.writeHead(400).end(); }
         });
         req.on('end', async () => {
-            if (refused) { return; }
+            if (refused) {
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `control request above ${CONTROL_REQUEST_MAX_BYTES} bytes` }));
+                return;
+            }
             const body = Buffer.concat(chunks).toString('utf8');
             try {
                 const { op, args } = JSON.parse(body || '{}') as { op?: string; args?: unknown };
