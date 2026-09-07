@@ -4,7 +4,7 @@
 import * as http from 'http';
 import { CmsisAction, IDebuggingHandler } from './debuggingHandler';
 import { WindowRegistration, WorkspaceRegistry, ResolutionReason, describeWindow } from './utils/workspaceRegistry';
-import { forwardTimeoutMs, pathHintOf } from './core/opTable';
+import { forwardTimeoutMs, pathHintOf, CONTROL_RESPONSE_MAX_BYTES } from './core/opTable';
 import { logger } from './utils/logger';
 
 /**
@@ -157,9 +157,20 @@ export class RoutingDebuggingHandler implements IDebuggingHandler {
                 },
                 timeout,
             }, (res) => {
-                let body = '';
-                res.on('data', (chunk) => { body += chunk; });
+                // Raw bytes, decoded once at the end — see ControlServer.onRequest.
+                const chunks: Buffer[] = [];
+                let size = 0;
+                res.on('data', (chunk: Buffer) => {
+                    size += chunk.length;
+                    if (size > CONTROL_RESPONSE_MAX_BYTES) {
+                        req.destroy(new Error(`control response above ${CONTROL_RESPONSE_MAX_BYTES} bytes from pid ${target.pid}`));
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
+                res.on('error', reject);
                 res.on('end', () => {
+                    const body = Buffer.concat(chunks).toString('utf8');
                     try {
                         const parsed = JSON.parse(body || '{}') as { result?: string; error?: string };
                         if (res.statusCode === 200 && parsed.result !== undefined) {

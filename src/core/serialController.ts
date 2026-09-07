@@ -126,13 +126,19 @@ class SerialController {
     async close(): Promise<void> {
         if (!this.port) { return; }
         const p = this.port;
-        await new Promise<void>((resolve, reject) => {
-            p.close((err) => err ? reject(err) : resolve());
-        });
-        this.port = null;
-        this.openedAt = null;
-        this.currentPath = null;
-        this.currentBaud = null;
+        try {
+            await new Promise<void>((resolve, reject) => {
+                p.close((err) => err ? reject(err) : resolve());
+            });
+        } finally {
+            // Forget the port even when closing it failed (the adapter was
+            // unplugged): otherwise every later open() refuses with "already
+            // open" and the only way out is a window reload.
+            this.port = null;
+            this.openedAt = null;
+            this.currentPath = null;
+            this.currentBaud = null;
+        }
     }
 
     async write(data: string | Buffer, encoding: 'utf8' | 'hex' = 'utf8'): Promise<number> {

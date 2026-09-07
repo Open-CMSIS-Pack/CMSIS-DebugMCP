@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { logger } from './logger';
+import { isTempPath, writeFileAtomicSync } from './atomicFile';
 
 /** One VS Code window's advertisement in the shared registry. */
 export interface WindowRegistration {
@@ -45,7 +46,7 @@ const DEFAULT_REGISTRY_DIR = path.join(os.tmpdir(), 'cmsis-developer-assistant-r
 const STALE_MS = 60_000;
 
 /** Best-effort pid liveness check (EPERM means the process exists). */
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
     try {
         process.kill(pid, 0);
         return true;
@@ -84,6 +85,8 @@ export class WorkspaceRegistry {
     private readonly registryDir: string;
     private readonly filePath: string;
     private readonly isAlive: LivenessCheck;
+    /** What this window last wrote; the heartbeat rewrites it without reading the file back. */
+    private current: WindowRegistration | undefined;
 
     constructor(
         private readonly pid: number = process.pid,
@@ -95,34 +98,52 @@ export class WorkspaceRegistry {
         this.isAlive = isAlive;
     }
 
-    /** Write (or overwrite) this window's registration. */
+    /**
+     * Write (or overwrite) this window's registration. Written through a
+     * temp file and a rename so a peer reading mid-write never sees a
+     * truncated file (and never prunes this window for it).
+     */
     public register(reg: Omit<WindowRegistration, 'pid' | 'updatedAt'>): void {
         try {
             fs.mkdirSync(this.registryDir, { recursive: true });
             const entry: WindowRegistration = { ...reg, pid: this.pid, updatedAt: Date.now() };
-            fs.writeFileSync(this.filePath, JSON.stringify(entry), 'utf8');
+            writeFileAtomicSync(this.filePath, JSON.stringify(entry));
+            this.current = entry;
         } catch (error) {
             logger.error('Failed to write CMSIS Developer Assistant registry entry', error);
         }
     }
 
-    /** Refresh `updatedAt` so other windows don't prune this one. */
+    /**
+     * Refresh `updatedAt` so other windows don't prune this one. Rewrites
+     * what this window last registered instead of reading the file back, so
+     * a registration a peer pruned by mistake heals on the next beat.
+     */
     public heartbeat(): void {
+        if (!this.current) {
+            return; // never registered — the caller registers on change
+        }
         try {
-            const entry = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as WindowRegistration;
-            entry.updatedAt = Date.now();
-            fs.writeFileSync(this.filePath, JSON.stringify(entry), 'utf8');
-        } catch {
-            // Entry missing — caller re-registers on change.
+            fs.mkdirSync(this.registryDir, { recursive: true });
+            this.current = { ...this.current, updatedAt: Date.now() };
+            writeFileAtomicSync(this.filePath, JSON.stringify(this.current));
+        } catch (error) {
+            logger.error('Failed to refresh CMSIS Developer Assistant registry entry', error);
         }
     }
 
     /** Remove this window's registration (on deactivate). */
     public unregister(): void {
+        this.current = undefined;
         this.tryUnlink(this.filePath);
     }
 
-    /** All live windows, pruning dead-pid and stale entries as a side effect. */
+    /**
+     * All live windows, pruning dead-pid and stale entries as a side effect.
+     * A file that does not parse is only removed once it is older than the
+     * staleness window: a fresh one is a peer's write in flight, not garbage.
+     * Temp files a crashed writer left behind are swept on the same rule.
+     */
     public list(): WindowRegistration[] {
         let files: string[];
         try {
@@ -132,10 +153,16 @@ export class WorkspaceRegistry {
         }
         const result: WindowRegistration[] = [];
         for (const file of files) {
-            if (!file.endsWith('.json')) {
+            const full = path.join(this.registryDir, file);
+            if (isTempPath(file)) {
+                if (this.isOlderThanStale(full)) {
+                    this.tryUnlink(full);
+                }
                 continue;
             }
-            const full = path.join(this.registryDir, file);
+            if (!file.startsWith('window-') || !file.endsWith('.json')) {
+                continue;
+            }
             try {
                 const entry = JSON.parse(fs.readFileSync(full, 'utf8')) as WindowRegistration;
                 const isStale = Date.now() - entry.updatedAt > STALE_MS;
@@ -145,10 +172,20 @@ export class WorkspaceRegistry {
                 }
                 result.push(entry);
             } catch {
-                this.tryUnlink(full);
+                if (this.isOlderThanStale(full)) {
+                    this.tryUnlink(full);
+                }
             }
         }
         return result;
+    }
+
+    private isOlderThanStale(full: string): boolean {
+        try {
+            return Date.now() - fs.statSync(full).mtimeMs > STALE_MS;
+        } catch {
+            return false;
+        }
     }
 
     /**

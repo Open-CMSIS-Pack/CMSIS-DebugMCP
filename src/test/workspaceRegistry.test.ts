@@ -66,11 +66,56 @@ suite('Workspace registry', () => {
         assert.deepStrictEqual(pids, [process.pid], 'the dead window should be pruned');
     });
 
-    test('a corrupt entry file is pruned rather than throwing', () => {
-        fs.writeFileSync(path.join(dir, 'window-123.json'), 'not json at all', 'utf8');
+    test('a freshly written unparsable file is skipped, not deleted — a peer may be mid-write', () => {
+        const file = path.join(dir, 'window-123.json');
+        fs.writeFileSync(file, '{"pid": 1', 'utf8');
         const registry = registryFor(process.pid);
         register(registry);
         assert.strictEqual(registry.list().length, 1);
+        assert.ok(fs.existsSync(file), 'the torn file survives the read');
+    });
+
+    test('an unparsable file older than the staleness window is pruned', () => {
+        const file = path.join(dir, 'window-123.json');
+        fs.writeFileSync(file, 'not json at all', 'utf8');
+        const old = (Date.now() - 120_000) / 1000;
+        fs.utimesSync(file, old, old);
+        const registry = registryFor(process.pid);
+        register(registry);
+        assert.strictEqual(registry.list().length, 1);
+        assert.ok(!fs.existsSync(file), 'stale garbage is removed');
+    });
+
+    test('a registration is written atomically and the heartbeat rewrites it without reading it back', () => {
+        const registry = registryFor(process.pid);
+        register(registry);
+        const file = path.join(dir, `window-${process.pid}.json`);
+        const before = JSON.parse(fs.readFileSync(file, 'utf8')).updatedAt as number;
+        assert.ok(!fs.readdirSync(dir).some(f => f.endsWith('.tmp')), 'no temp file left behind');
+        // A peer pruned this window by mistake: the next beat heals it.
+        fs.unlinkSync(file);
+        registry.heartbeat();
+        const entries = registry.list();
+        assert.strictEqual(entries.length, 1);
+        assert.ok(entries[0].updatedAt >= before);
+        // Never registered: a heartbeat writes nothing.
+        const silent = registryFor(process.pid + 1);
+        silent.heartbeat();
+        assert.ok(!fs.existsSync(path.join(dir, `window-${process.pid + 1}.json`)));
+    });
+
+    test('temp files of a crashed writer are swept once stale, fresh ones are left alone', () => {
+        const stale = path.join(dir, 'window-77.json.77.deadbeef.tmp');
+        const fresh = path.join(dir, 'window-78.json.78.cafebabe.tmp');
+        fs.writeFileSync(stale, '{}', 'utf8');
+        fs.writeFileSync(fresh, '{}', 'utf8');
+        const old = (Date.now() - 120_000) / 1000;
+        fs.utimesSync(stale, old, old);
+        const registry = registryFor(process.pid);
+        register(registry);
+        assert.strictEqual(registry.list().length, 1, 'temp files are never listed as windows');
+        assert.ok(!fs.existsSync(stale));
+        assert.ok(fs.existsSync(fresh));
     });
 
     suite('findByPath', () => {

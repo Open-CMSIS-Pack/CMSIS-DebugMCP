@@ -37,6 +37,14 @@ import type { SerialHandler } from '../serialHandler';
 import type { PackDocsHandler } from '../packDocsHandler';
 import type { BuildInfoHandler } from '../buildInfoHandler';
 
+/**
+ * Body caps on the control channel — a runaway stop, not a budget. Tool
+ * arguments never exceed the MCP request limit (1 MiB, express.json);
+ * results are clipped by every renderer's `maxChars` well below 16 MiB.
+ */
+export const CONTROL_REQUEST_MAX_BYTES = 1024 * 1024;
+export const CONTROL_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
+
 /** Ops served by the debugging handler. */
 export const DEBUG_OPS = [
     'handleStartDebugging',

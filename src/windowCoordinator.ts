@@ -23,6 +23,8 @@ import { HardwareTimeouts } from './debuggingExecutor';
 import { RoutingDebuggingHandler } from './routingDebuggingHandler';
 import type { PackDocsHandlers } from './packDocsDispatch';
 import { WorkspaceRegistry } from './utils/workspaceRegistry';
+import { serialController } from './core/serialController';
+import { serialMonitorBridge } from './core/serialMonitorBridge';
 import { logger } from './utils/logger';
 
 /** Refresh well inside the registry's 60 s staleness window. */
@@ -55,6 +57,21 @@ export interface CoordinatorOptions {
      * tools at all.
      */
     packDocs?: PackDocsHandlers;
+    /**
+     * Release this window's serial backends on dispose. Every window may own
+     * a serial port (serial ops run in the window the router forwards to),
+     * so the teardown lives here, not in the router-only MCP server.
+     * Injectable for tests; bounded to two seconds so a wedged tty cannot
+     * hold `deactivate`.
+     */
+    serialTeardown?: () => Promise<void>;
+}
+
+const SERIAL_TEARDOWN_MS = 2_000;
+
+async function defaultSerialTeardown(): Promise<void> {
+    await serialController.close();
+    serialMonitorBridge.unsubscribe();
 }
 
 /**
@@ -138,6 +155,9 @@ export class WindowCoordinator {
             this.stopPromotionPolling();
             logger.info(`This window is the CMSIS Developer Assistant router on ${this.getEndpoint()}`);
         } catch (error) {
+            // Whatever start() managed to set up is released (a no-op when
+            // the port bind itself failed).
+            await server.stop().catch(() => undefined);
             if (error instanceof PortInUseError) {
                 logger.info('Another window is the router; this window is a worker.');
                 this.startPromotionPolling();
@@ -242,6 +262,16 @@ export class WindowCoordinator {
         if (this.controlServer) {
             await this.controlServer.stop().catch(err => logger.error('Error stopping control server', err));
             this.controlServer = undefined;
+        }
+        const teardown = this.options.serialTeardown ?? defaultSerialTeardown;
+        let timer: NodeJS.Timeout | undefined;
+        const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, SERIAL_TEARDOWN_MS); });
+        try {
+            await Promise.race([teardown(), bound]);
+        } catch (err) {
+            logger.warn(`Failed to clean up serial backends on shutdown: ${err}`);
+        } finally {
+            if (timer) { clearTimeout(timer); }
         }
     }
 }

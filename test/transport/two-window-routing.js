@@ -130,7 +130,8 @@ async function main() {
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cmsis-projects-'));
     const alphaDir = path.join(root, 'alpha');
-    const betaDir = path.join(root, 'beta');
+    // A non-ASCII folder name: the path crosses the registry file, the router and the MCP reply as UTF-8.
+    const betaDir = path.join(root, 'beta-😀');
     fs.mkdirSync(alphaDir, { recursive: true });
     fs.mkdirSync(betaDir, { recursive: true });
 

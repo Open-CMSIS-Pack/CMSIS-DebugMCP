@@ -3,6 +3,7 @@
 
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { ControlServer } from '../controlServer';
@@ -10,6 +11,7 @@ import { RoutingDebuggingHandler } from '../routingDebuggingHandler';
 import { IDebuggingHandler } from '../debuggingHandler';
 import { WindowRegistration, WorkspaceRegistry } from '../utils/workspaceRegistry';
 import {
+    CONTROL_REQUEST_MAX_BYTES, CONTROL_RESPONSE_MAX_BYTES,
     DEBUG_OPS, PACKDOCS_BUILD_OPS, PACKDOCS_DOC_OPS, PACKDOCS_OPS, SERIAL_OPS,
     forwardTimeoutMs, isKnownOp, isPackDocsDocOp, isPackDocsOp, isSerialOp, pathHintOf,
 } from '../core/opTable';
@@ -336,6 +338,123 @@ suite('Multi-window routing', () => {
             assert.match(result, /"address":"0x20000000"/);
             assert.match(result, /"length":64/);
             assert.match(result, /"format":"hex"/);
+        });
+
+        /** A raw POST to a window's control server, chunked (no Content-Length) so each write is its own frame. */
+        function rawPost(entry: WindowRegistration, writes: Buffer[], gapMs = 20): Promise<{ status: number; body: string }> {
+            return new Promise((resolve, reject) => {
+                const req = http.request({
+                    host: '127.0.0.1', port: entry.controlPort, path: '/op', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-cmsis-developer-assistant-token': entry.controlToken },
+                }, (res) => {
+                    const chunks: Buffer[] = [];
+                    res.on('data', (c: Buffer) => chunks.push(c));
+                    res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+                });
+                req.on('error', reject);
+                (async () => {
+                    for (const [i, w] of writes.entries()) {
+                        if (i > 0) { await new Promise(r => setTimeout(r, gapMs)); }
+                        req.write(w);
+                    }
+                    req.end();
+                })().catch(reject);
+            });
+        }
+
+        test('a multibyte character split across request chunks reaches the handler whole', async () => {
+            const entry = await window('utf', { workspaceFolders: [path.join(dir, 'utf')] });
+            const buf = Buffer.from(JSON.stringify({ op: 'handleReadMemory', args: { address: 'a😀b' } }));
+            const cut = buf.indexOf(Buffer.from('😀')) + 2; // inside the four-byte sequence
+            const { status, body } = await rawPost(entry, [buf.subarray(0, cut), buf.subarray(cut)]);
+            assert.strictEqual(status, 200, body);
+            const parsed = JSON.parse(body) as { result: string };
+            assert.match(parsed.result, /"address":"a😀b"/);
+            assert.doesNotMatch(parsed.result, /\uFFFD/);
+        });
+
+        test('a multibyte character split across response chunks survives the router', async () => {
+            // A stand-in window whose control server splits its reply inside the emoji.
+            const reply = Buffer.from(JSON.stringify({ result: 'ok 😀 done' }));
+            const cut = reply.indexOf(Buffer.from('😀')) + 1;
+            const raw = http.createServer((_req, res) => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.write(reply.subarray(0, cut));
+                setTimeout(() => res.end(reply.subarray(cut)), 20);
+            });
+            await new Promise<void>(resolve => raw.listen(0, '127.0.0.1', resolve));
+            try {
+                const port = (raw.address() as { port: number }).port;
+                const pid = nextPid++;
+                livePids.add(pid);
+                const entry: WindowRegistration = { pid, controlPort: port, controlToken: 'raw', workspaceFolders: [path.join(dir, 'raw')], name: 'raw', updatedAt: Date.now() };
+                fs.writeFileSync(path.join(dir, 'window-raw.json'), JSON.stringify(entry), 'utf8');
+                assert.strictEqual(await router().handleGetSessionStatus(), 'ok 😀 done');
+            } finally {
+                await new Promise<void>(resolve => raw.close(() => resolve()));
+            }
+        });
+
+        test('an oversize control request is refused with 413 and the window keeps serving', async () => {
+            const entry = await window('big', { workspaceFolders: [path.join(dir, 'big')] });
+            const filler = Buffer.alloc(CONTROL_REQUEST_MAX_BYTES + 1, 0x20);
+            const { status, body } = await rawPost(entry, [Buffer.from('{"op":"handleGetSessionStatus","args":{}'), filler, Buffer.from('}')], 0);
+            assert.strictEqual(status, 413, body);
+            assert.match(body, /control request above \d+ bytes/);
+            assert.match(await router().handleGetSessionStatus(), /^big:handleGetSessionStatus:/);
+        });
+
+        test('an oversize control response is rejected on the router', async () => {
+            const raw = http.createServer((_req, res) => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.write('{"result":"');
+                res.end(Buffer.alloc(CONTROL_RESPONSE_MAX_BYTES + 1, 0x41));
+            });
+            await new Promise<void>(resolve => raw.listen(0, '127.0.0.1', resolve));
+            try {
+                const port = (raw.address() as { port: number }).port;
+                const pid = nextPid++;
+                livePids.add(pid);
+                const entry: WindowRegistration = { pid, controlPort: port, controlToken: 'raw', workspaceFolders: [path.join(dir, 'raw2')], name: 'raw2', updatedAt: Date.now() };
+                fs.writeFileSync(path.join(dir, 'window-raw2.json'), JSON.stringify(entry), 'utf8');
+                await assert.rejects(() => router().handleGetSessionStatus(), /control response above \d+ bytes/);
+            } finally {
+                await new Promise<void>(resolve => raw.close(() => resolve()));
+            }
+        });
+
+        test('a client that aborts mid-request does not take the window down', async () => {
+            const entry = await window('abort', { workspaceFolders: [path.join(dir, 'abort')] });
+            await new Promise<void>((resolve) => {
+                const req = http.request({
+                    host: '127.0.0.1', port: entry.controlPort, path: '/op', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-cmsis-developer-assistant-token': entry.controlToken },
+                });
+                req.on('error', () => resolve());
+                req.write('{"op":"handleGetSess');
+                setTimeout(() => { req.destroy(); resolve(); }, 20);
+            });
+            await new Promise(r => setTimeout(r, 50));
+            assert.match(await router().handleGetSessionStatus(), /^abort:handleGetSessionStatus:/);
+        });
+
+        test('stop() returns while a request is still in flight', async () => {
+            const hanging = { handleGetSessionStatus: () => new Promise<string>(() => { /* never */ }) } as unknown as IDebuggingHandler;
+            const server = new ControlServer(hanging, 'tok');
+            const port = await server.start();
+            const client = new Promise<string>((resolve) => {
+                const req = http.request({
+                    host: '127.0.0.1', port, path: '/op', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-cmsis-developer-assistant-token': 'tok' },
+                }, () => resolve('answered'));
+                req.on('error', (e) => resolve(e.message));
+                req.end(JSON.stringify({ op: 'handleGetSessionStatus', args: {} }));
+            });
+            await new Promise(r => setTimeout(r, 100));
+            const t0 = Date.now();
+            await server.stop();
+            assert.ok(Date.now() - t0 < 3_000, `stop took ${Date.now() - t0} ms`);
+            assert.match(await client, /socket hang up|ECONNRESET|aborted/);
         });
 
         test('a dead window surfaces as an actionable error', async () => {

@@ -155,6 +155,12 @@ async function main() {
     const serialCount = names.filter((n) => n.startsWith('serial_')).length;
     check('the serial tools are registered by default', serialCount === 10, `${serialCount} serial tools`);
 
+    // 4a. The MCP body limit is explicit (1 MiB, matching the control channel's request cap).
+    const oversize = await request(port, 'POST', { 'mcp-session-id': sid }, {
+        jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'get_session_status', arguments: { blob: 'x'.repeat(1_100_000) } },
+    });
+    check('a request body above 1 MiB is refused with 413', oversize.status === 413, `status=${oversize.status}`);
+
     // 4b. get_debug_instructions serves one topic on request and a small
     //     overview with the topic list by default.
     const topicCall = await request(port, 'POST', { 'mcp-session-id': sid }, {

@@ -4,9 +4,10 @@
 import * as http from 'http';
 import { IDebuggingHandler } from './debuggingHandler';
 import { serialHandler } from './serialHandler';
-import { isKnownOp, isPackDocsDocOp, isPackDocsOp, isSerialOp } from './core/opTable';
+import { isKnownOp, isPackDocsDocOp, isPackDocsOp, isSerialOp, CONTROL_REQUEST_MAX_BYTES } from './core/opTable';
 import type { PackDocsHandlers } from './packDocsDispatch';
 import { logger } from './utils/logger';
+import { closeHttpServer } from './utils/closeHttpServer';
 
 /**
  * Per-window loopback HTTP server that runs debug operations against this
@@ -63,7 +64,7 @@ export class ControlServer {
             const server = this.server;
             this.server = undefined;
             this.boundPort = 0;
-            await new Promise<void>((resolve) => server.close(() => resolve()));
+            await closeHttpServer(server);
         }
     }
 
@@ -77,9 +78,31 @@ export class ControlServer {
             return;
         }
 
-        let body = '';
-        req.on('data', (chunk) => { body += chunk; });
+        // Collect the raw bytes and decode once: appending Buffer chunks to a
+        // string decodes each chunk on its own, which turns a multibyte
+        // character split across two chunks into two U+FFFD.
+        const chunks: Buffer[] = [];
+        let size = 0;
+        let refused = false;
+        req.on('data', (chunk: Buffer) => {
+            if (refused) { return; }
+            size += chunk.length;
+            if (size > CONTROL_REQUEST_MAX_BYTES) {
+                refused = true;
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `control request above ${CONTROL_REQUEST_MAX_BYTES} bytes` }));
+                req.destroy();
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('error', (err) => {
+            logger.warn(`Control request aborted: ${err.message}`);
+            if (!res.headersSent) { res.writeHead(400).end(); }
+        });
         req.on('end', async () => {
+            if (refused) { return; }
+            const body = Buffer.concat(chunks).toString('utf8');
             try {
                 const { op, args } = JSON.parse(body || '{}') as { op?: string; args?: unknown };
                 if (typeof op !== 'string') {

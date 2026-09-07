@@ -14,6 +14,7 @@ import {
 } from '.';
 import { HardwareTimeouts, SERVER_VERSION } from './debuggingExecutor';
 import { logger } from './utils/logger';
+import { closeHttpServer } from './utils/closeHttpServer';
 import { serialHandler } from './serialHandler';
 import { SerialOpName } from './core/opTable';
 import type { PackDocsDispatch } from './packDocsDispatch';
@@ -1187,7 +1188,8 @@ export class DebugMCPServer {
             });
 
             // Parse JSON body for incoming requests
-            app.use(express.json());
+            // Explicit rather than body-parser's 100 kB default; the control channel caps at the same size.
+            app.use(express.json({ limit: '1mb' }));
 
             // POST /mcp — client→server JSON-RPC. An `initialize` request with
             // no session id opens a session (transport + McpServer pair) and is
@@ -1203,6 +1205,9 @@ export class DebugMCPServer {
             // McpServer being closed and reconnected per request. A
             // session-scoped server is never closed mid-flight.
             app.post('/mcp', async (req: any, res: any) => {
+                // A transport + server pair created for this request; released
+                // in the catch when setup fails before the session is registered.
+                let fresh: { transport: StreamableHTTPServerTransport; server: McpServer } | undefined;
                 try {
                     const sessionId = req.headers['mcp-session-id'] as string | undefined;
                     let transport: StreamableHTTPServerTransport;
@@ -1225,6 +1230,7 @@ export class DebugMCPServer {
                             }
                         };
                         const sessionServer = this.createMcpServer();
+                        fresh = { transport, server: sessionServer };
                         await sessionServer.connect(transport);
                     } else {
                         res.status(400).json({
@@ -1238,6 +1244,13 @@ export class DebugMCPServer {
                     await transport.handleRequest(req, res, req.body);
                 } catch (err) {
                     logger.error('MCP request handling failed', err);
+                    const sid = fresh?.transport.sessionId;
+                    if (fresh && !(sid && this.transports[sid])) {
+                        // Never registered: nothing else will close the pair.
+                        await fresh.transport.close().catch(() => undefined);
+                        await fresh.server.close().catch(() => undefined);
+                        logger.warn('MCP session setup failed; transport released');
+                    }
                     if (!res.headersSent) {
                         res.status(500).json({
                             jsonrpc: '2.0',
@@ -1361,23 +1374,16 @@ export class DebugMCPServer {
         }
         this.transports = {};
 
-        // Release any owned serial port and unsubscribe from the Serial Monitor bridge.
-        try {
-            const { serialController } = await import('./core/serialController.js');
-            await serialController.close();
-            const { serialMonitorBridge } = await import('./core/serialMonitorBridge.js');
-            serialMonitorBridge.unsubscribe();
-        } catch (err) {
-            logger.warn(`Failed to clean up serial backends on shutdown: ${err}`);
-        }
+        // Serial backends are released by the window coordinator: this server
+        // exists in the router window only, and the port belongs to whichever
+        // window opened it.
 
-
-        // Close the HTTP server
+        // Close the HTTP server, bounded — see closeHttpServer.
         if (this.httpServer) {
             const server = this.httpServer;
             this.httpServer = null;
             this.actualPort = null;
-            await new Promise<void>((resolve) => server.close(() => resolve()));
+            await closeHttpServer(server);
         }
 
         logger.info('CMSIS Developer Assistant server stopped');
