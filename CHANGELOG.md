@@ -4,7 +4,7 @@ All notable changes to CMSIS Developer Assistant will be documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.3.10] - 2026-09-07
 
 ### Added
 - Tests for the DNS-rebinding guard (`isLoopbackHostHeader` / `isLoopbackOrigin`), the hardware timeout wrapper, and the pdf.js worker's positive timeout, restart, idle retirement and dispose-while-pending paths (through an injectable stand-in worker).
