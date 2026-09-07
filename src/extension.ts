@@ -8,6 +8,7 @@ import { AgentConfigurationManager } from './utils/agentConfigurationManager';
 import { clearSvdCache } from './core/svdParser';
 import { logger } from './utils/logger';
 import { registerSessionStateTracker } from './utils/sessionStateTracker';
+import { registerToolchainPackRootInvalidation } from './utils/toolchainPackRoot';
 import { WindowCoordinator } from './windowCoordinator';
 import { createPackDocsHandlers, readPackDocsGates } from './packDocsHost';
 import { registerPackDocsCommands } from './packDocsCommands';
@@ -63,6 +64,10 @@ export async function activate(context: vscode.ExtensionContext) {
     // Track DAP stopped/continued events so we can answer "is the target
     // currently paused?" reliably, regardless of what activeStackItem says.
     registerSessionStateTracker(context);
+
+    // The CMSIS Solution extension's pack root is asked for once and re-asked
+    // after an extension or settings change (documentation tools, SVD lookup).
+    registerToolchainPackRootInvalidation(context);
 
     // Drop the parsed-SVD cache when a debug session ends — the next session
     // may target a different device, and the module-level cache in svdParser

@@ -160,10 +160,25 @@ export function parseCbuildRun(content: string, file: string): CbuildRunInfo {
     return info;
 }
 
-/** `$CMSIS_PACK_ROOT`, else `~/.cache/arm/packs` — the CMSIS-Toolbox default. */
-export function defaultPackRoot(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+/**
+ * `$CMSIS_PACK_ROOT`, else the CMSIS-Toolbox default: `%LOCALAPPDATA%\Arm\Packs`
+ * on Windows (`<home>\AppData\Local\Arm\Packs` when LOCALAPPDATA is unset),
+ * `~/.cache/arm/packs` elsewhere.
+ */
+export function defaultPackRoot(
+    env: NodeJS.ProcessEnv = process.env,
+    home: string = os.homedir(),
+    platform: NodeJS.Platform = process.platform,
+): string {
     const fromEnv = env.CMSIS_PACK_ROOT?.trim();
-    return fromEnv ? fromEnv : path.join(home, '.cache', 'arm', 'packs');
+    if (fromEnv) { return fromEnv; }
+    if (platform === 'win32') {
+        const localAppData = env.LOCALAPPDATA?.trim();
+        return localAppData
+            ? path.join(localAppData, 'Arm', 'Packs')
+            : path.join(home, 'AppData', 'Local', 'Arm', 'Packs');
+    }
+    return path.join(home, '.cache', 'arm', 'packs');
 }
 
 export function expandPackRoot(filePath: string, packRoot: string): string {

@@ -60,8 +60,20 @@ suite('cbuildRun', () => {
     });
 
     test('pack root default and expansion', () => {
-        assert.strictEqual(defaultPackRoot({}, '/home/u'), path.join('/home/u', '.cache', 'arm', 'packs'));
-        assert.strictEqual(defaultPackRoot({ CMSIS_PACK_ROOT: '/opt/packs' }, '/home/u'), '/opt/packs');
+        assert.strictEqual(defaultPackRoot({}, '/home/u', 'linux'), path.join('/home/u', '.cache', 'arm', 'packs'));
+        assert.strictEqual(defaultPackRoot({}, '/Users/u', 'darwin'), path.join('/Users/u', '.cache', 'arm', 'packs'));
+        assert.strictEqual(defaultPackRoot({ CMSIS_PACK_ROOT: '/opt/packs' }, '/home/u', 'linux'), '/opt/packs');
+        assert.strictEqual(defaultPackRoot({ CMSIS_PACK_ROOT: '  ' }, '/home/u', 'linux'), path.join('/home/u', '.cache', 'arm', 'packs'));
+        // Windows: %LOCALAPPDATA%\Arm\Packs, never ~/.cache — and CMSIS_PACK_ROOT still wins.
+        assert.strictEqual(
+            defaultPackRoot({ LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }, 'C:\\Users\\u', 'win32'),
+            path.join('C:\\Users\\u\\AppData\\Local', 'Arm', 'Packs'));
+        assert.strictEqual(
+            defaultPackRoot({}, 'C:\\Users\\u', 'win32'),
+            path.join('C:\\Users\\u', 'AppData', 'Local', 'Arm', 'Packs'));
+        assert.strictEqual(
+            defaultPackRoot({ LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', CMSIS_PACK_ROOT: 'D:\\packs' }, 'C:\\Users\\u', 'win32'),
+            'D:\\packs');
         assert.strictEqual(expandPackRoot('${CMSIS_PACK_ROOT}/Keil/X/1.0.0/a.svd', '/p'), '/p/Keil/X/1.0.0/a.svd');
         assert.strictEqual(packDir('/p', { vendor: 'Keil', name: 'X', version: '1.0.0' }), path.join('/p', 'Keil', 'X', '1.0.0'));
         assert.strictEqual(packDir('/p', { vendor: 'Keil', name: 'X' }), undefined);

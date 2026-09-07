@@ -57,7 +57,12 @@ export interface PackDocsSettings {
 }
 
 export interface PackDocsHost {
-    /** `$CMSIS_PACK_ROOT`, else `~/.cache/arm/packs`. */
+    /**
+     * `$CMSIS_PACK_ROOT`, else the CMSIS-Toolbox default (`%LOCALAPPDATA%\Arm\Packs`
+     * on Windows, `~/.cache/arm/packs` elsewhere). `resolveTarget` prefers
+     * `packRootFromToolchain()` and records the outcome as
+     * `TargetResolution.packRoot`, which consumers read instead of this.
+     */
     packRoot: string;
     /** Where page text, metadata and indexes are cached (globalStorage/packdocs). */
     storageDir: string;
@@ -71,6 +76,8 @@ export interface PackDocsHost {
     userAgent: string;
     /** Injected by tests; defaults to the global `fetch`. */
     fetchFn?: (url: string, init?: RequestInit) => Promise<Response>;
+    /** Tests and loopback fixtures only: let `fetch_doc` reach local and private addresses. */
+    allowPrivateHosts?: boolean;
     settings(): PackDocsSettings;
     log: PackDocsLog;
     /**
@@ -80,6 +87,28 @@ export interface PackDocsHost {
      * undefined leaves the choice to `target` / the caller.
      */
     activeContext?(): Promise<ActiveContextHint | undefined>;
+    /**
+     * The pack root the CMSIS Solution extension resolves
+     * (`cmsis-csolution.getPackRootPath`: `$CMSIS_PACK_ROOT` or its OS
+     * default), when the host can ask and the extension is active. Asked
+     * before every target resolution so both extensions look in the same
+     * place; undefined, an empty answer or an error keep `packRoot`.
+     */
+    packRootFromToolchain?(): Promise<string | undefined>;
+}
+
+/**
+ * `packRootFromToolchain()` when it answers with a non-empty path, else
+ * `host.packRoot` — never throws.
+ */
+export async function effectivePackRoot(host: PackDocsHost): Promise<string> {
+    if (!host.packRootFromToolchain) { return host.packRoot; }
+    try {
+        const answer = (await host.packRootFromToolchain())?.trim();
+        return answer ? answer : host.packRoot;
+    } catch {
+        return host.packRoot;
+    }
 }
 
 export const silentLog: PackDocsLog = {

@@ -181,6 +181,31 @@ suite('SVD path resolution', () => {
         assert.strictEqual((await resolveSvdPath({ workspaceCbuildRunFiles: async () => [run], workspaceSvdFiles: none })).path, hp, 'workspace scan works without a session');
     });
 
+    test('${CMSIS_PACK_ROOT} expands to the injected pack root, as a path or a resolver', async () => {
+        const svd = touch('packs/dev.svd');
+        const packs = path.join(dir, 'packs');
+        assert.strictEqual((await resolveSvdPath({ ...base, svdFile: '${CMSIS_PACK_ROOT}/dev.svd', packRoot: packs })).path, svd);
+        assert.strictEqual((await resolveSvdPath({ ...base, svdFile: '${CMSIS_PACK_ROOT}/dev.svd', packRoot: async () => packs })).path, svd);
+        assert.strictEqual((await resolveSvdPath({ ...base, svdFile: '$CMSIS_PACK_ROOT/dev.svd', packRoot: packs })).path, svd, 'the brace-less form is accepted too');
+        // A cbuild-run entry under the pack root resolves through the same injection.
+        const run = touch('out/app.cbuild-run.yml', [
+            'system-descriptions:',
+            '  - file: ${CMSIS_PACK_ROOT}/dev.svd',
+            '    type: svd',
+            '',
+        ].join('\n'));
+        assert.strictEqual((await resolveSvdPath({ ...base, cbuildRunFile: run, packRoot: packs })).path, svd);
+        // Without an injected root the environment's CMSIS_PACK_ROOT applies.
+        const saved = process.env.CMSIS_PACK_ROOT;
+        process.env.CMSIS_PACK_ROOT = packs;
+        try {
+            assert.strictEqual((await resolveSvdPath({ ...base, cbuildRunFile: run })).path, svd);
+        } finally {
+            if (saved === undefined) { delete process.env.CMSIS_PACK_ROOT; } else { process.env.CMSIS_PACK_ROOT = saved; }
+        }
+        assert.strictEqual((await resolveSvdPath({ ...base, svdFile: '${CMSIS_PACK_ROOT}/dev.svd', packRoot: path.join(dir, 'elsewhere') })).path, null, 'a wrong root does not find it');
+    });
+
     test('a single workspace SVD is used, several are not guessed between', async () => {
         const one = touch('a.svd');
         assert.strictEqual((await resolveSvdPath({ workspaceCbuildRunFiles: none, workspaceSvdFiles: async () => [one] })).path, one);

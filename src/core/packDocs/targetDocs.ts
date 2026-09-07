@@ -28,7 +28,7 @@ import * as path from 'path';
 import {
     CbuildRunInfo, PackId, QualifiedName, formatPackId, packDir, parseCbuildRun, parsePackId, parseQualifiedName,
 } from './cbuildRun';
-import { PackDocsHost } from './host';
+import { PackDocsHost, effectivePackRoot } from './host';
 import { activeContextOf, describeActiveContext, matchesActiveContext } from './cbuildRun';
 import { archOf, armDocsFor } from './armDocs';
 import {
@@ -54,6 +54,13 @@ export interface TargetResolution {
     board?: QualifiedName;
     boardPack?: PackId;
     cbuildRunFile?: string;
+    /**
+     * The pack root the resolution was made under: the CMSIS Solution
+     * extension's answer when the host can ask it, else `host.packRoot`.
+     * Every consumer reads this rather than the host, so a host copy taken
+     * before the toolchain answered cannot send it to the wrong directory.
+     */
+    packRoot: string;
     notes: string[];
 }
 
@@ -64,6 +71,9 @@ function describeCbuildRun(info: CbuildRunInfo): string {
 }
 
 export async function resolveTarget(host: PackDocsHost, args: TargetArgs): Promise<TargetResult> {
+    // The CMSIS Solution extension's pack root when it is active, else the
+    // host's; recorded on the resolution for every consumer.
+    const packRoot = await effectivePackRoot(host);
     const log = host.log;
     const notes: string[] = [];
 
@@ -71,8 +81,8 @@ export async function resolveTarget(host: PackDocsHost, args: TargetArgs): Promi
         const id = parsePackId(args.pack);
         if (!id) { return { error: `pack '${args.pack}' is not of the form Vendor::Name@version` }; }
         if (!id.version) {
-            const picked = pickInstalledVersion(host.packRoot, id);
-            if (!picked) { return { error: `pack ${formatPackId(id)} is not installed under ${host.packRoot}` }; }
+            const picked = pickInstalledVersion(packRoot, id);
+            if (!picked) { return { error: `pack ${formatPackId(id)} is not installed under ${packRoot}` }; }
             notes.push(`pack version not given; using installed ${picked}`);
             id.version = picked;
         }
@@ -81,6 +91,7 @@ export async function resolveTarget(host: PackDocsHost, args: TargetArgs): Promi
             devicePack: id,
             device: args.device ? parseQualifiedName(args.device) : undefined,
             board: args.board ? parseQualifiedName(args.board) : undefined,
+            packRoot,
             notes,
         };
     }
@@ -155,6 +166,7 @@ export async function resolveTarget(host: PackDocsHost, args: TargetArgs): Promi
         board: args.board ? parseQualifiedName(args.board) : info.board,
         boardPack: info.boardPack,
         cbuildRunFile: info.file,
+        packRoot,
         notes,
     };
 }
@@ -189,17 +201,17 @@ export function pickInstalledVersion(packRoot: string, id: PackId): string | und
  * version when the exact one is missing (the cbuild-run may predate a pack
  * update).
  */
-export function locatePack(host: PackDocsHost, id: PackId, notes: string[]): { dir: string; id: PackId } | undefined {
-    const exact = packDir(host.packRoot, id);
+export function locatePack(packRoot: string, id: PackId, notes: string[]): { dir: string; id: PackId } | undefined {
+    const exact = packDir(packRoot, id);
     if (exact && fs.existsSync(exact)) { return { dir: exact, id }; }
-    const fallback = pickInstalledVersion(host.packRoot, id);
+    const fallback = pickInstalledVersion(packRoot, id);
     if (!fallback) {
-        notes.push(`pack ${formatPackId(id)} is not installed under ${host.packRoot}`);
+        notes.push(`pack ${formatPackId(id)} is not installed under ${packRoot}`);
         return undefined;
     }
     const alt = { ...id, version: fallback };
     notes.push(`pack ${formatPackId(id)} is not installed; using ${formatPackId(alt)}`);
-    return { dir: packDir(host.packRoot, alt)!, id: alt };
+    return { dir: packDir(packRoot, alt)!, id: alt };
 }
 
 export interface TargetDocs {
@@ -241,7 +253,7 @@ export function collectTargetDocs(host: PackDocsHost, res: TargetResolution): Ta
 
     const visit = (id: PackId | undefined, query: { deviceName?: string; boardName?: string }, label: string) => {
         if (!id) { return; }
-        const located = locatePack(host, id, notes);
+        const located = locatePack(res.packRoot, id, notes);
         if (!located) { return; }
         const pdscPath = findPdscFile(located.dir, located.id);
         if (!pdscPath) {
@@ -301,7 +313,7 @@ export function collectTargetDocs(host: PackDocsHost, res: TargetResolution): Ta
 export function resolveSvd(host: PackDocsHost, res: TargetResolution, pname?: string): SvdRef | undefined {
     if (!res.devicePack) { return undefined; }
     const notes: string[] = [];
-    const located = locatePack(host, res.devicePack, notes);
+    const located = locatePack(res.packRoot, res.devicePack, notes);
     if (!located) { return undefined; }
     const pdscPath = findPdscFile(located.dir, located.id);
     if (!pdscPath) { return undefined; }

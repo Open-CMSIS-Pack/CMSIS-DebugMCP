@@ -9,7 +9,7 @@
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either produced or implied.
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -29,6 +29,7 @@ import { PackDocsHost, PackDocsSettings, defaultSettings } from './core/packDocs
 import { defaultPackRoot, resolveUserDocsDir } from './core/packDocs';
 import { ActiveContextHint } from './core/packDocs/cbuildRun';
 import { withTimeout } from './utils/timeout';
+import { toolchainPackRoot } from './utils/toolchainPackRoot';
 import { PackDocsHandler } from './packDocsHandler';
 import { BuildInfoHandler } from './buildInfoHandler';
 import { PackDocsHandlers } from './packDocsDispatch';
@@ -108,8 +109,21 @@ async function activeContext(): Promise<ActiveContextHint | undefined> {
 }
 
 export function makePackDocsHost(context: vscode.ExtensionContext): PackDocsHost {
+    // `$CMSIS_PACK_ROOT` or the platform default until the CMSIS Solution
+    // extension answers; from then on its pack root, so both extensions
+    // agree on where the packs are (the panel's and the tools' "not
+    // installed" notes name the same directory). `resolveTarget` asks the
+    // hook before every resolution and records the answer on the
+    // resolution, so consumers do not depend on this getter.
+    let packRoot = defaultPackRoot();
+    const packRootFromToolchain = async (): Promise<string | undefined> => {
+        const fromToolchain = await toolchainPackRoot();
+        if (fromToolchain) { packRoot = fromToolchain; }
+        return fromToolchain;
+    };
     return {
-        packRoot: defaultPackRoot(),
+        get packRoot() { return packRoot; },
+        packRootFromToolchain,
         // Page text, metadata and indexes live in this extension's global
         // storage; a user coming from the standalone CMSIS Pack Docs
         // extension re-extracts once.
@@ -149,9 +163,10 @@ export function createPackDocsHandlers(context: vscode.ExtensionContext, timeout
     const build = new BuildInfoHandler(makeBuildInfoHost(), { timeoutMs, workspaceRoot });
 
     const s = readPackDocsSettings();
-    logger.info(`Pack docs: pack root ${host.packRoot}${process.env.CMSIS_PACK_ROOT ? ' (CMSIS_PACK_ROOT)' : ''}, ` +
+    logger.info(`Pack docs: default pack root ${host.packRoot}${process.env.CMSIS_PACK_ROOT ? ' (CMSIS_PACK_ROOT)' : ' (platform default)'}, ` +
         `page store ${host.storageDir}, extractor ${s.extractor} (${s.pdftotextPath}), maxPdfMb ${s.maxPdfMb}, ` +
         `workspaceDocDirs ${s.workspaceDocDirs.join(', ')}, userDocsDir ${resolveUserDocsDir(s.userDocsDir)}`);
+    void host.packRootFromToolchain?.();
     void docs.getExtractor().available().then((a) => {
         if (a.ok) {
             logger.info(`Pack docs extractor: ${a.detail}`);

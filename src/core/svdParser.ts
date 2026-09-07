@@ -16,8 +16,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import * as vscode from 'vscode';
+import { defaultPackRoot, expandPackRoot } from './packDocs/cbuildRun';
+import { effectiveToolchainPackRoot } from '../utils/toolchainPackRoot';
 
 /**
  * CMSIS-SVD reader: finds the device description for a debug session or a
@@ -110,6 +111,12 @@ export interface SvdResolveContext {
     workspaceCbuildRunFiles: () => Promise<string[]>;
     /** Any `.svd` in the workspace; used only when exactly one exists. */
     workspaceSvdFiles: () => Promise<string[]>;
+    /**
+     * What `${CMSIS_PACK_ROOT}` in `svdFile` and cbuild-run entries expands
+     * to: a path, or a function that resolves one (the CMSIS Solution
+     * extension's answer); `defaultPackRoot()` when absent.
+     */
+    packRoot?: string | (() => Promise<string>);
 }
 
 export interface SvdResolution {
@@ -128,9 +135,10 @@ export interface SvdResolution {
  */
 export async function resolveSvdPath(ctx: SvdResolveContext): Promise<SvdResolution> {
     const tried: string[] = [];
+    const packRoot = typeof ctx.packRoot === 'function' ? await ctx.packRoot() : (ctx.packRoot ?? defaultPackRoot());
 
     if (ctx.svdFile) {
-        const resolved = resolvePackRoot(ctx.svdFile);
+        const resolved = expandPackRoot(ctx.svdFile, packRoot);
         if (fs.existsSync(resolved)) { return { path: resolved, tried }; }
         tried.push(`svdFile ${resolved} (not found)`);
     }
@@ -139,7 +147,7 @@ export async function resolveSvdPath(ctx: SvdResolveContext): Promise<SvdResolut
     const scan = async (file: string, label: string): Promise<string | null> => {
         if (scanned.has(file)) { return null; }
         scanned.add(file);
-        const hit = findSvdInCbuildRun(file, ctx.pname, ctx.sessionName);
+        const hit = findSvdInCbuildRun(file, packRoot, ctx.pname, ctx.sessionName);
         tried.push(`${label} ${file}${hit ? '' : ' (no usable SVD entry)'}`);
         return hit;
     };
@@ -212,25 +220,16 @@ export function selectSvdEntry<T extends { pname?: string }>(entries: T[], pname
     return entries[0];
 }
 
-function findSvdInCbuildRun(filePath: string, pname?: string, sessionName?: string): string | null {
+function findSvdInCbuildRun(filePath: string, packRoot: string, pname?: string, sessionName?: string): string | null {
     try {
         const entries = svdEntriesFromCbuildRun(fs.readFileSync(filePath, 'utf-8'));
         const entry = selectSvdEntry(entries, pname, sessionName);
         if (!entry) { return null; }
-        const resolved = resolvePackRoot(entry.file);
+        const resolved = expandPackRoot(entry.file, packRoot);
         return fs.existsSync(resolved) ? resolved : null;
     } catch {
         return null;
     }
-}
-
-function resolvePackRoot(filePath: string): string {
-    if (filePath.includes('${CMSIS_PACK_ROOT}')) {
-        const packRoot = process.env.CMSIS_PACK_ROOT
-            || path.join(os.homedir(), '.cache', 'arm', 'packs');
-        return filePath.replace('${CMSIS_PACK_ROOT}', packRoot);
-    }
-    return filePath;
 }
 
 /** The headless transport harness stubs `vscode.workspace` without findFiles. */
@@ -244,10 +243,13 @@ async function workspaceGlob(pattern: string, max: number): Promise<string[]> {
     }
 }
 
-function workspaceContext(): Pick<SvdResolveContext, 'workspaceCbuildRunFiles' | 'workspaceSvdFiles'> {
+function workspaceContext(): Pick<SvdResolveContext, 'workspaceCbuildRunFiles' | 'workspaceSvdFiles' | 'packRoot'> {
     return {
         workspaceCbuildRunFiles: () => workspaceGlob('out/**/*.cbuild-run.yml', 10),
         workspaceSvdFiles: () => workspaceGlob('**/*.svd', 5),
+        // The same root the documentation tools use, so `lookup_peripheral`
+        // and `list_target_docs` agree on where the packs are.
+        packRoot: effectiveToolchainPackRoot,
     };
 }
 
