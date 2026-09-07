@@ -18,7 +18,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { collectUserDocs, globToRegex, importUserDoc, readManifest, resolveUserDocsDir, userScopeDir } from '../core/packDocs/userDocs';
+import { collectUserDocs, globToRegex, importUserDoc, readManifest, resolveUserDocsDir, userDocId, userScopeDir } from '../core/packDocs/userDocs';
 import { PackDocsHandler } from '../packDocsHandler';
 import { FakeExtractor, buildWorld } from './packDocsHandler.test';
 
@@ -61,12 +61,14 @@ suite('userDocs', () => {
         }));
 
         const r = collectUserDocs(root, TARGET);
+        // Ids carry the scope folder, so a file name repeated in two scopes never collides.
         assert.deepStrictEqual(r.docs.map(d => d.id).sort(), [
-            'user/an-deep', ...(globFolders ? ['user/errata-prelim'] : []), 'user/everyone', 'user/rm0456-nda', 'user/schematic', 'user/trm-notes', 'user/vendor-wide',
+            'user/boards/b-u585i-iot02a/schematic', 'user/cores/cortex-m33/trm-notes', ...(globFolders ? ['user/devices/stm32u5/errata-prelim'] : []),
+            'user/everyone', 'user/keil/stm32u5xx-dfp/rm0456-nda', 'user/keil/stm32u5xx-dfp/sub/an-deep', 'user/keil/vendor-wide',
         ]);
         // Directory enumeration order differs between file systems (NTFS sorts case-insensitively), so compare as sets.
         assert.deepStrictEqual([...r.matched].sort(), ['.', 'Keil', 'Keil/STM32U5xx_DFP', 'boards/B-U585I-IOT02A', 'cores/cortex-m33', ...(globFolders ? ['devices/STM32U5*'] : [])].sort());
-        const rm = r.docs.find(d => d.id === 'user/rm0456-nda')!;
+        const rm = r.docs.find(d => d.id === 'user/keil/stm32u5xx-dfp/rm0456-nda')!;
         assert.strictEqual(rm.title, 'STM32U5 reference manual');
         assert.strictEqual(rm.category, 'manual');
         assert.strictEqual(rm.revision, 'Rev 2 (NDA)');
@@ -77,8 +79,20 @@ suite('userDocs', () => {
         assert.deepStrictEqual(r.notes, []);
 
         const other = collectUserDocs(root, { devicePack: { vendor: 'NXP', name: 'MCXN947_DFP' }, device: 'MCXN947', cores: ['Cortex-M33'] });
-        assert.deepStrictEqual(other.docs.map(d => d.id).sort(), ['user/everyone', 'user/trm-notes']);
+        assert.deepStrictEqual(other.docs.map(d => d.id).sort(), ['user/cores/cortex-m33/trm-notes', 'user/everyone']);
         assert.deepStrictEqual(collectUserDocs(path.join(root, 'missing'), TARGET).docs, []);
+    });
+
+    test('the same file name in two scopes yields two distinct, stable ids', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'packdocs-user-dup-'));
+        touch(path.join(root, 'Keil', 'STM32U5xx_DFP', 'RM0456.pdf'));
+        touch(path.join(root, 'boards', 'B-U585I-IOT02A', 'RM0456.pdf'));
+        touch(path.join(root, 'RM0456.pdf'));
+        const ids = () => collectUserDocs(root, TARGET).docs.map(d => d.id).sort();
+        assert.deepStrictEqual(ids(), ['user/boards/b-u585i-iot02a/rm0456', 'user/keil/stm32u5xx-dfp/rm0456', 'user/rm0456']);
+        assert.deepStrictEqual(ids(), ids(), 'identical across calls');
+        assert.strictEqual(userDocId(root, path.join(root, 'x.pdf')), 'user/x');
+        assert.strictEqual(userDocId(root, path.join(root, 'devices', 'STM32U5*', 'Errata (prelim).pdf')), 'user/devices/stm32u5/errata-prelim');
     });
 
     test('globs, scope folders and the default directory', () => {
@@ -105,7 +119,7 @@ suite('userDocs', () => {
         touch(file);
         const r = importUserDoc(root, { kind: 'pack', vendor: 'Keil', name: 'STM32U5xx_DFP' }, file, { title: 'STM32U5 RM', category: 'manual', revision: ' Rev 2 ' });
         assert.strictEqual(r.dest, path.join(root, 'Keil', 'STM32U5xx_DFP', 'RM0456 (NDA).pdf'));
-        assert.strictEqual(r.id, 'user/rm0456-nda');
+        assert.strictEqual(r.id, 'user/keil/stm32u5xx-dfp/rm0456-nda');
         assert.strictEqual(r.replaced, false);
         assert.ok(fs.existsSync(r.dest));
         assert.deepStrictEqual(readManifest(r.dir), { 'RM0456 (NDA).pdf': { title: 'STM32U5 RM', category: 'manual', revision: 'Rev 2' } });
@@ -113,7 +127,7 @@ suite('userDocs', () => {
         assert.strictEqual(again.replaced, true);
         assert.deepStrictEqual(readManifest(r.dir)['RM0456 (NDA).pdf'], { title: 'STM32U5 RM', category: 'manual', revision: 'Rev 3' }, 'metadata merges');
         const listed = collectUserDocs(root, TARGET);
-        assert.deepStrictEqual(listed.docs.map(d => `${d.id}:${d.title}:${d.revision}`), ['user/rm0456-nda:STM32U5 RM:Rev 3']);
+        assert.deepStrictEqual(listed.docs.map(d => `${d.id}:${d.title}:${d.revision}`), ['user/keil/stm32u5xx-dfp/rm0456-nda:STM32U5 RM:Rev 3']);
         importUserDoc(root, { kind: 'all' }, file);
         assert.ok(fs.existsSync(path.join(root, 'RM0456 (NDA).pdf')));
         assert.ok(!fs.existsSync(path.join(root, 'docs.json')), 'no manifest without metadata');
@@ -128,11 +142,11 @@ suite('userDocs', () => {
         const h = new PackDocsHandler(host, { timeoutMs: 30_000, workspaceRoot: () => world.workspace, extractor: new FakeExtractor(['1 Secret\nUSART_CR1 UE bit', '2 More']) });
         const list = await h.handleListTargetDocs({});
         const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // the temp dir has backslashes on Windows
-        assert.match(list, new RegExp(`User documents \\(${escapedRoot}: Keil\\/STM32F7xx_DFP\\):\\n  user\\/nda-manual · user \\[manual\\] · NDA manual · 1 kB, not indexed yet\\n`));
+        assert.match(list, new RegExp(`User documents \\(${escapedRoot}: Keil\\/STM32F7xx_DFP\\):\\n  user\\/keil\\/stm32f7xx-dfp\\/nda-manual · user \\[manual\\] · NDA manual · 1 kB, not indexed yet\\n`));
         const search = await h.handleSearchTargetDocs({ query: 'USART_CR1', doc: 'nda-manual' });
-        assert.match(search, /#1 user\/nda-manual \[Rev 1\] p\.1 §1 Secret/);
+        assert.match(search, /#1 user\/keil\/stm32f7xx-dfp\/nda-manual \[Rev 1\] p\.1 §1 Secret/);
         const listed = await h.handleListTargetDocs({});
-        assert.match(listed, /user\/nda-manual · user \[manual\] · NDA manual · indexed Rev 1, 2 p/);
+        assert.match(listed, /user\/keil\/stm32f7xx-dfp\/nda-manual · user \[manual\] · NDA manual · indexed Rev 1, 2 p/);
         assert.match(listed, /searchable \(2 in packs, 1 user, 2 in the workspace; /);
         const inspect = await h.inspectTarget({});
         assert.strictEqual(inspect.userDir, root);

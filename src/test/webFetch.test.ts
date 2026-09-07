@@ -28,7 +28,7 @@ import { armDocApiUrl, armDocId, armDocUrl, parseArmDocId, parseArmDocUrl } from
 import { silentLog } from '../core/packDocs/host';
 import { PageStore } from '../core/packDocs/pageStore';
 import { DocRef } from '../core/packDocs/pdscBooks';
-import { FetchFn, ResolveContext, armResolver, directPdfResolver, downloadPdf, fetchDocument } from '../core/packDocs/webFetch';
+import { FetchFn, ResolveContext, armResolver, blockedHostReason, directPdfResolver, downloadPdf, fetchDocument } from '../core/packDocs/webFetch';
 
 const FIXTURES = path.join(__dirname, '..', '..', '..', 'src', 'test', 'fixtures', 'packdocs');
 const ARM = path.join(FIXTURES, 'arm');
@@ -188,6 +188,62 @@ suite('webFetch resolvers', () => {
     });
 });
 
+suite('webFetch private-address guard', () => {
+    test('blockedHostReason: loopback, link-local, private, CGNAT, metadata and localhost are refused; public hosts pass', () => {
+        const blocked = ['127.0.0.1', '127.1.2.3', 'localhost', 'LOCALHOST', 'foo.localhost', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1',
+            '169.254.169.254', '0.0.0.0', '100.64.0.1', '224.0.0.1', '::1', '[::1]', '::', 'fe80::1', 'fd00::1', 'fc00::1', '::ffff:127.0.0.1',
+            'metadata.google.internal', 'metadata', 'instance-data'];
+        for (const h of blocked) { assert.ok(blockedHostReason(h), `${h} should be blocked`); }
+        const allowed = ['172.32.0.1', '172.15.0.1', '100.63.0.1', '100.128.0.1', 'x', 'documentation-service.arm.com', '8.8.8.8', '2606:4700::1', '11.0.0.1', 'localhost.example.com'];
+        for (const h of allowed) { assert.strictEqual(blockedHostReason(h), undefined, `${h} should be allowed`); }
+    });
+
+    test('direct: a private-address URL is refused before any request is made', async () => {
+        const { fn, calls } = fakeFetch({});
+        const r = await directPdfResolver.resolve(webDoc('http://127.0.0.1:3001/mcp'), ctx(fn));
+        assert.ok('error' in r && /points at a local or private address \(loopback address 127\.0\.0\.0\/8\)/.test(r.error), JSON.stringify(r));
+        assert.ok('error' in r && /workspace docs folder/.test(r.error));
+        assert.strictEqual(calls.length, 0);
+        const meta = await directPdfResolver.resolve(webDoc('http://169.254.169.254/latest/meta-data'), ctx(fn));
+        assert.ok('error' in meta && /link-local/.test(meta.error));
+        assert.strictEqual(calls.length, 0);
+    });
+
+    test('redirects are followed one hop at a time and every target is checked', async () => {
+        const redirect = (to: string): Route => () => new Response(null, { status: 302, headers: { location: to } });
+        const { fn, calls } = fakeFetch({
+            'https://x/bounce.pdf': redirect('http://169.254.169.254/latest/meta-data'),
+            'https://x/r.pdf': redirect('/a.pdf'),
+            'https://x/a.pdf': pdf(),
+            'https://x/loop.pdf': redirect('https://x/loop.pdf'),
+        });
+        const bounced = await directPdfResolver.resolve(webDoc('https://x/bounce.pdf'), ctx(fn));
+        assert.ok('error' in bounced && /169\.254\.169\.254.*link-local/.test(bounced.error), JSON.stringify(bounced));
+        assert.strictEqual(calls.length, 1, 'the redirect target was never requested');
+        assert.ok(calls.every(c => c.init?.redirect === 'manual'), 'redirects are never delegated to fetch');
+
+        const followed = await directPdfResolver.resolve(webDoc('https://x/r.pdf'), ctx(fn));
+        assert.ok(!('error' in followed) && followed.kind === 'pdf', JSON.stringify(followed));
+
+        const looped = await directPdfResolver.resolve(webDoc('https://x/loop.pdf'), ctx(fn));
+        assert.ok('error' in looped && /too many redirects/.test(looped.error), JSON.stringify(looped));
+    });
+
+    test('allowPrivateHosts lets a loopback fixture through', async () => {
+        const { fn } = fakeFetch({ 'http://127.0.0.1:8080/a.pdf': pdf() });
+        const r = await directPdfResolver.resolve(webDoc('http://127.0.0.1:8080/a.pdf'), ctx(fn, { allowPrivateHosts: true }));
+        assert.ok(!('error' in r) && r.kind === 'pdf', JSON.stringify(r));
+    });
+
+    test('downloadPdf refuses a redirect onto a private host and leaves no .part file', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'packdocs-dl-guard-'));
+        const { fn } = fakeFetch({ 'https://x/bounce.pdf': () => new Response(null, { status: 307, headers: { location: 'http://10.0.0.5/secret.pdf' } }) });
+        await assert.rejects(downloadPdf('https://x/bounce.pdf', path.join(dir, 'g.pdf'), ctx(fn)), /download of .* failed: .*private address 10\.0\.0\.0\/8/);
+        assert.deepStrictEqual(fs.readdirSync(dir), []);
+        await assert.rejects(downloadPdf('http://localhost:3001/x.pdf', path.join(dir, 'h.pdf'), ctx(fn)), /localhost/);
+    });
+});
+
 suite('webFetch download and fetchDocument', () => {
     test('downloadPdf streams to a .part file, hashes, and refuses non-PDF or oversize bodies', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'packdocs-dl-'));
@@ -203,6 +259,15 @@ suite('webFetch download and fetchDocument', () => {
         assert.ok(!fs.existsSync(path.join(dir, 'b.pdf.part')), 'no leftover');
         await assert.rejects(downloadPdf('https://x/huge.pdf', path.join(dir, 'c.pdf'), ctx(fn, { maxBytes: 1000 })), /maxPdfMb/);
         await assert.rejects(downloadPdf('https://x/missing.pdf', path.join(dir, 'd.pdf'), ctx(fn)), /HTTP 404/);
+    });
+
+    test('a write-stream error rejects the download instead of crashing the host or hanging', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'packdocs-dl-err-'));
+        const { fn } = fakeFetch({ 'https://x/a.pdf': pdf() });
+        // The .part path is a directory: the write stream fails asynchronously (EISDIR).
+        fs.mkdirSync(path.join(dir, 'e.pdf.part'));
+        await assert.rejects(downloadPdf('https://x/a.pdf', path.join(dir, 'e.pdf'), ctx(fn)), /download of .* failed: .*EISDIR/);
+        assert.ok(!fs.existsSync(path.join(dir, 'e.pdf')));
     });
 
     test('fetchDocument caches the PDF and its provenance under the store id; annotate reads it back', async () => {

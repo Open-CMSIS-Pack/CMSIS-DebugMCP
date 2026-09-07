@@ -27,7 +27,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { PackDocsHost, PackDocsLog, defaultSettings } from '../core/packDocs/host';
 import { PdfExtractor, PdftotextExtractor } from '../core/packDocs/pdfExtract';
-import { resolveTarget } from '../core/packDocs/targetDocs';
+import { collectTargetDocs, resolveSvd, resolveTarget } from '../core/packDocs/targetDocs';
 import { PackDocsHandler } from '../packDocsHandler';
 import { SAMPLE_CBUILD_RUN } from './cbuildRun.test';
 import { ARM_ROUTES, fakeFetch, json, pdf } from './webFetch.test';
@@ -134,6 +134,47 @@ suite('PackDocsHandler (end to end)', () => {
         assert.match(none.error, /No \*\.cbuild-run\.yml found in the workspace/);
         const missing = await resolveTarget(world.host, { target: 'nonexistent' });
         assert.ok('error' in missing && /No cbuild-run context matches target 'nonexistent'/.test(missing.error));
+    });
+
+    test('resolveTarget looks under the pack root the CMSIS Solution extension reports', async () => {
+        // The host's own packRoot points nowhere; only the toolchain hook knows the real one.
+        const viaHook = await resolveTarget({ ...world.host, packRoot: '/nowhere', packRootFromToolchain: async () => world.packRoot }, { pack: 'Keil::STM32F7xx_DFP', device: 'STM32F756ZGTx' });
+        assert.ok(!('error' in viaHook), JSON.stringify(viaHook));
+        assert.strictEqual(viaHook.devicePack?.version, '3.0.0');
+
+        // An empty, undefined or failing answer keeps the host's packRoot.
+        for (const hook of [async () => '', async () => '  ', async () => undefined, async () => { throw new Error('not active'); }]) {
+            const kept = await resolveTarget({ ...world.host, packRootFromToolchain: hook }, { pack: 'Keil::STM32F7xx_DFP', device: 'STM32F756ZGTx' });
+            assert.ok(!('error' in kept), JSON.stringify(kept));
+            const nowhere = await resolveTarget({ ...world.host, packRoot: '/nowhere', packRootFromToolchain: hook }, { pack: 'Keil::STM32F7xx_DFP' });
+            assert.ok('error' in nowhere && nowhere.error.includes('/nowhere'), JSON.stringify(nowhere));
+        }
+    });
+
+    test('the document list, the SVD lookup and the core header follow the pack root the toolchain reports', async () => {
+        // A plain object host, no getter: only the hook knows the real root, and the
+        // resolution must carry it to every consumer.
+        const host: PackDocsHost = { ...world.host, packRoot: '/nowhere', packRootFromToolchain: async () => world.packRoot };
+        const res = await resolveTarget(host, { pack: 'Keil::STM32F7xx_DFP', device: 'STM32F756ZGTx' });
+        assert.ok(!('error' in res), JSON.stringify(res));
+        assert.strictEqual(res.packRoot, world.packRoot);
+
+        const t = collectTargetDocs(host, res);
+        assert.ok(t.docs.some(d => d.title === 'Test Reference Manual' && d.path?.startsWith(world.packRoot)), t.docs.map(d => d.id).join(', '));
+        assert.ok(t.processors.length > 0, 'processors come from the pdsc under the reported root');
+        assert.ok(!t.notes.some(n => n.includes('/nowhere')), t.notes.join('; '));
+        const svd = resolveSvd(host, res);
+        assert.ok(svd?.exists && svd.path.startsWith(world.packRoot), JSON.stringify(svd));
+
+        const h = new PackDocsHandler(host, { timeoutMs: 30_000, workspaceRoot: () => world.workspace });
+        const listing = await h.handleListTargetDocs({});
+        assert.ok(listing.includes('Test Reference Manual') && !listing.includes('/nowhere'), listing);
+        const inspection = await h.inspectTarget({});
+        assert.ok(inspection.svd?.exists, JSON.stringify(inspection.svd));
+
+        // Without a hook the resolution records the host's own root.
+        const own = await resolveTarget({ ...world.host, packRoot: '/nowhere' }, { pack: 'Keil::STM32F7xx_DFP@3.0.0', device: 'STM32F756ZGTx' });
+        assert.ok(!('error' in own) && own.packRoot === '/nowhere', JSON.stringify(own));
     });
 
     test('resolveTarget prefers the active csolution context when the workspace holds several solutions', async () => {
@@ -313,5 +354,30 @@ suite('PackDocsHandler (end to end)', () => {
         const h = new PackDocsHandler(slowHost, { timeoutMs: 100 });
         const text = await h.handleListTargetDocs({});
         assert.match(text, /list_target_docs timed out after 100 ms/);
+    });
+
+    // Last: these extract a document the listing tests above expect unindexed.
+    test('read_doc_pages and fetch_doc report an ambiguous short id instead of picking one', async () => {
+        await handler.handleListTargetDocs({});
+        const read = await handler.handleReadDocPages({ doc: 'rm', pages: '1' });
+        assert.match(read, /^Document id 'rm' is ambiguous — it matches .*stm32f7xx-dfp\/test-rm.*workspace\/vendor-rm.*\. Pass one of these ids\.$/);
+        assert.match(await handler.handleFetchDoc({ doc: 'rm' }), /^Document id 'rm' is ambiguous/);
+        // A unique trailing segment and a case difference still resolve.
+        const byBoth = await handler.handleReadDocPages({ doc: 'TEST-RM', pages: '1' });
+        assert.doesNotMatch(byBoth, /ambiguous|No document with id/);
+        assert.match(await handler.handleReadDocPages({ doc: 'nothing-like-this', pages: '1' }), /^No document with id 'nothing-like-this'/);
+    });
+
+    test('read_doc_pages honours maxPdfMb before extracting, like search and the index command', async () => {
+        const tiny = new PackDocsHandler({
+            ...world.host,
+            storageDir: path.join(world.root, 'store-tiny'),
+            settings: () => ({ ...world.host.settings(), maxPdfMb: 0.0001 }),
+        }, { timeoutMs: 30_000, workspaceRoot: () => world.workspace });
+        const text = await tiny.handleReadDocPages({ doc: 'stm32f7xx-dfp/test-rm', pages: '1' });
+        assert.match(text, /^stm32f7xx-dfp\/test-rm is not indexed and will not be extracted: \d+ MB exceeds maxPdfMb 0\.0001 \(cmsis-developer-assistant\.packDocs\.maxPdfMb\)\.$/);
+        assert.ok(!fs.existsSync(path.join(world.root, 'store-tiny')) || !fs.readdirSync(path.join(world.root, 'store-tiny'), { recursive: true }).some(f => String(f).endsWith('.pages.jsonl')), 'nothing was extracted');
+        const doc = { id: 'x', title: 'x', scope: 'unlisted', source: 'pack', path: path.join(world.packRoot, 'Keil', 'STM32F7xx_DFP', '3.0.0', 'Documentation', 'test-rm.pdf'), sizeBytes: 5_000_000, cached: false, indexed: false } as const;
+        await assert.rejects(() => tiny.indexDocument({ ...doc }), /exceeds maxPdfMb 0\.0001/);
     });
 });

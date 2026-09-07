@@ -25,7 +25,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { BookCategory, DocRef, UserScope, fileSlug, importUserDoc, resolveUserDocsDir } from './core/packDocs';
+import { BookCategory, DocRef, UserScope, importUserDoc, resolveUserDocsDir } from './core/packDocs';
 import { PackDocsHandlers } from './packDocsDispatch';
 import { readPackDocsSettings } from './packDocsHost';
 import { PackDocsPanel } from './packDocsPanel';
@@ -137,7 +137,7 @@ async function importUserDocuments(handlers: PackDocsHandlers): Promise<void> {
         if (revision === undefined) { return; }
         const r = importUserDoc(root, scope, uri.fsPath, { title, category: category.category, revision });
         const doc: DocRef = {
-            id: `user/${fileSlug(name)}`, title: title.trim() || name, ...(category.category ? { category: category.category } : {}), ...(revision.trim() ? { revision: revision.trim() } : {}),
+            id: r.id, title: title.trim() || name, ...(category.category ? { category: category.category } : {}), ...(revision.trim() ? { revision: revision.trim() } : {}),
             scope: 'user', source: 'user', path: r.dest, sizeBytes: fs.statSync(r.dest).size, cached: false, indexed: false,
         };
         imported.push({ doc, dest: r.dest, replaced: r.replaced });

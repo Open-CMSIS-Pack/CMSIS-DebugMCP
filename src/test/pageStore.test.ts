@@ -284,6 +284,58 @@ suite('pageStore', () => {
         extractor.dispose();
     });
 
+    const SLOW = path.join(FIXTURES, 'slowPdfWorker.js');
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    test('pdf.js: a positive timeout mid-extraction rejects, terminates the thread, and the next request gets a fresh one', async () => {
+        const x = new PdfjsExtractor(60_000, SLOW);
+        try {
+            const warm = (await x.extract('warm.pdf')).pages[0];
+            assert.ok(x.isRunning());
+            const t0 = Date.now();
+            await assert.rejects(() => x.extract('hang.pdf', { timeoutMs: 100 }), /timed out after 100 ms/);
+            assert.ok(Date.now() - t0 < 1_000);
+            assert.ok(!x.isRunning(), 'the thread is gone after the timeout');
+            const a = (await x.extract('a.pdf')).pages[0];
+            const b = (await x.extract('b.pdf')).pages[0];
+            assert.notStrictEqual(a, warm, 'a fresh thread after the timeout');
+            assert.strictEqual(a, b, 'the fresh thread is reused for the next document');
+        } finally { x.dispose(); }
+    });
+
+    test('pdf.js: a timeout fails the other pending request with "terminated"', async () => {
+        const x = new PdfjsExtractor(60_000, SLOW);
+        try {
+            const short = assert.rejects(() => x.extract('hang.pdf', { timeoutMs: 100 }), /timed out/);
+            const long = assert.rejects(() => x.extract('hang.pdf', { timeoutMs: 10_000 }), /worker terminated/);
+            await Promise.all([short, long]);
+        } finally { x.dispose(); }
+    });
+
+    test('pdf.js: an idle thread is retired and restarted on demand', async () => {
+        const x = new PdfjsExtractor(50, SLOW);
+        try {
+            const first = (await x.extract('a.pdf')).pages[0];
+            await sleep(300);
+            assert.ok(!x.isRunning(), 'retired after idleMs');
+            const second = (await x.extract('a.pdf')).pages[0];
+            assert.notStrictEqual(first, second, 'a new thread after retirement');
+        } finally { x.dispose(); }
+    });
+
+    test('pdf.js: dispose while a request is pending rejects it, and the extractor stays usable', async () => {
+        const x = new PdfjsExtractor(60_000, SLOW);
+        const pending = assert.rejects(() => x.extract('hang.pdf', { timeoutMs: 10_000 }), /disposed/);
+        await sleep(20);
+        const t0 = Date.now();
+        x.dispose();
+        await pending;
+        assert.ok(Date.now() - t0 < 200);
+        assert.ok(!x.isRunning());
+        assert.strictEqual((await x.extract('ok.pdf')).pages.length, 1);
+        x.dispose();
+    });
+
     test('pdf.js extracts when another extension has patched Array.prototype in the host', async () => {
         // The CMSIS csolution extension assigns `Array.prototype.groupedBy` in
         // the shared extension host; pdf.js refuses to start on a prototype

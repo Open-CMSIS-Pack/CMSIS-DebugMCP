@@ -48,6 +48,102 @@ export interface ResolveContext {
     timeoutMs: number;
     /** Largest download accepted. */
     maxBytes: number;
+    /** Tests and loopback fixtures only: skip the private-address block. */
+    allowPrivateHosts?: boolean;
+}
+
+/** Redirect hops followed before giving up. */
+export const MAX_REDIRECTS = 5;
+
+function ipv4Octets(host: string): number[] | undefined {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (!m) { return undefined; }
+    const o = m.slice(1).map(Number);
+    return o.every(n => n <= 255) ? o : undefined;
+}
+
+/**
+ * Why `hostname` (as `new URL(url).hostname` gives it — the WHATWG parser
+ * already normalises `2130706433`, `0x7f.1` and `017700000001` to dotted
+ * quads) must not be fetched: loopback, link-local, RFC 1918, CGNAT,
+ * multicast, the cloud metadata names, or `localhost`. Undefined for a
+ * public host. No DNS lookup: a public name resolving to a private address
+ * is not caught here.
+ */
+export function blockedHostReason(hostname: string): string | undefined {
+    const h = hostname.toLowerCase().replace(/\.$/, '');
+    if (h === 'localhost' || h.endsWith('.localhost')) { return 'localhost'; }
+    if (h === 'metadata' || h === 'metadata.google.internal' || h === 'instance-data') { return 'cloud metadata service'; }
+    const v4 = ipv4Octets(h);
+    if (v4) {
+        const [a, b] = v4;
+        if (a === 0) { return 'this-host address 0.0.0.0/8'; }
+        if (a === 10) { return 'private address 10.0.0.0/8'; }
+        if (a === 127) { return 'loopback address 127.0.0.0/8'; }
+        if (a === 169 && b === 254) { return 'link-local address 169.254.0.0/16'; }
+        if (a === 172 && b >= 16 && b <= 31) { return 'private address 172.16.0.0/12'; }
+        if (a === 192 && b === 168) { return 'private address 192.168.0.0/16'; }
+        if (a === 100 && b >= 64 && b <= 127) { return 'carrier-grade NAT address 100.64.0.0/10'; }
+        if (a >= 224) { return 'multicast or reserved address'; }
+        return undefined;
+    }
+    const v6 = h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+    if (v6.includes(':')) {
+        if (v6 === '::' || v6 === '::1') { return 'IPv6 loopback or unspecified address'; }
+        const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(v6);
+        if (mapped) { return blockedHostReason(mapped[1]); }
+        const first = v6.split(':')[0];
+        const word = parseInt(first || '0', 16);
+        if (first.length && (word & 0xffc0) === 0xfe80) { return 'IPv6 link-local address fe80::/10'; }
+        if (first.length && (word & 0xfe00) === 0xfc00) { return 'IPv6 unique-local address fc00::/7'; }
+    }
+    return undefined;
+}
+
+/** A URL the guard refused — final, never retried through another strategy. */
+export class BlockedHostError extends Error {
+    constructor(url: string, reason: string) {
+        super(`${url} points at a local or private address (${reason}); fetch_doc downloads public documents only — copy the PDF into the workspace docs folder instead`);
+        this.name = 'BlockedHostError';
+    }
+}
+
+function refuseIfBlocked(url: string, ctx: ResolveContext): void {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new BlockedHostError(url, 'not an http(s) URL');
+    }
+    if (ctx.allowPrivateHosts) { return; }
+    const reason = blockedHostReason(parsed.hostname);
+    if (reason) {
+        throw new BlockedHostError(url, reason);
+    }
+}
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * `ctx.fetchFn` with the private-address check on the URL and on every
+ * redirect target: redirects are followed one hop at a time so a public
+ * URL cannot bounce the request onto the MCP or control port. A fetchFn
+ * that followed redirects on its own is checked on `res.url` as well.
+ */
+export async function fetchGuarded(url: string, init: RequestInit, ctx: ResolveContext): Promise<Response> {
+    let current = url;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+        refuseIfBlocked(current, ctx);
+        const res = await ctx.fetchFn(current, { ...init, redirect: 'manual' });
+        const location = res.headers.get('location');
+        if (REDIRECT_STATUS.has(res.status) && location) {
+            const next = new URL(location, current).href;
+            ctx.log.debug(`${current} → ${res.status} redirect to ${next}`);
+            current = next;
+            continue;
+        }
+        if (res.url && res.url !== current) { refuseIfBlocked(res.url, ctx); }
+        return res;
+    }
+    throw new Error(`${url}: too many redirects (more than ${MAX_REDIRECTS})`);
 }
 
 export interface ResolvedDoc {
@@ -112,7 +208,7 @@ interface ArmVersion { version?: string; versionLabel?: string }
 async function getJson<T>(url: string, ctx: ResolveContext): Promise<{ status: number; body?: T; error?: string }> {
     const t0 = Date.now();
     try {
-        const res = await ctx.fetchFn(url, { headers: headers(ctx, 'application/json'), signal: signal(ctx), redirect: 'follow' });
+        const res = await fetchGuarded(url, { headers: headers(ctx, 'application/json'), signal: signal(ctx) }, ctx);
         const text = await res.text();
         ctx.log.debug(`GET ${url} → ${res.status} ${res.headers.get('content-type') ?? ''} ${text.length} chars in ${Date.now() - t0} ms`);
         if (!res.ok) { return { status: res.status, error: `HTTP ${res.status}` }; }
@@ -182,9 +278,14 @@ export const directPdfResolver: DocResolver = {
         const url = doc.url!;
         const filename = path.basename(new URL(url).pathname) || 'document.pdf';
         const ok = (): ResolvedDoc => ({ kind: 'pdf', downloadUrl: url, filename, title: doc.title });
+        try {
+            refuseIfBlocked(url, ctx);
+        } catch (e) {
+            return { error: describeError(e) };
+        }
         const t0 = Date.now();
         try {
-            const head = await ctx.fetchFn(url, { method: 'HEAD', headers: headers(ctx, 'application/pdf,*/*'), signal: signal(ctx), redirect: 'follow' });
+            const head = await fetchGuarded(url, { method: 'HEAD', headers: headers(ctx, 'application/pdf,*/*'), signal: signal(ctx) }, ctx);
             const type = (head.headers.get('content-type') ?? '').toLowerCase();
             const length = Number(head.headers.get('content-length') ?? 0);
             ctx.log.debug(`HEAD ${url} → ${head.status} ${type} ${length} in ${Date.now() - t0} ms`);
@@ -192,11 +293,12 @@ export const directPdfResolver: DocResolver = {
             if (head.ok && type.includes('application/pdf')) { return ok(); }
             if (head.ok && type.includes('text/html')) { return { error: `${url} is a web page, not a PDF — open the link in a browser and download the PDF into the workspace docs folder` }; }
         } catch (e) {
+            if (e instanceof BlockedHostError) { return { error: e.message }; }
             ctx.log.debug(`HEAD ${url} failed: ${describeError(e)}`);
         }
         // No usable HEAD: peek at the first bytes.
         try {
-            const res = await ctx.fetchFn(url, { headers: headers(ctx, 'application/pdf,*/*', { Range: 'bytes=0-1023' }), signal: signal(ctx), redirect: 'follow' });
+            const res = await fetchGuarded(url, { headers: headers(ctx, 'application/pdf,*/*', { Range: 'bytes=0-1023' }), signal: signal(ctx) }, ctx);
             if (!res.ok) { return { error: `${url} answered HTTP ${res.status}` }; }
             const type = (res.headers.get('content-type') ?? '').toLowerCase();
             const buf = Buffer.from(await res.arrayBuffer());
@@ -225,11 +327,17 @@ export async function downloadPdf(url: string, dest: string, ctx: ResolveContext
     const part = `${dest}.part`;
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     const out = fs.createWriteStream(part);
+    // Observed from the first byte: a stream error mid-download (full disk,
+    // unwritable store) must become this call's error, not an unhandled
+    // 'error' event on the extension host — and must end a back-pressure
+    // wait that would otherwise never resolve.
+    const failed = new Promise<never>((_resolve, reject) => out.once('error', reject));
+    failed.catch(() => undefined);
     const hash = crypto.createHash('sha256');
     let bytes = 0;
     let first = true;
     try {
-        const res = await ctx.fetchFn(url, { headers: headers(ctx, 'application/pdf,*/*'), signal: controller.signal, redirect: 'follow' });
+        const res = await fetchGuarded(url, { headers: headers(ctx, 'application/pdf,*/*'), signal: controller.signal }, ctx);
         if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
         const length = Number(res.headers.get('content-length') ?? 0);
         if (length > ctx.maxBytes) { throw new Error(`${(length / 1024 / 1024).toFixed(0)} MB is above the maxPdfMb limit`); }
@@ -244,10 +352,11 @@ export async function downloadPdf(url: string, dest: string, ctx: ResolveContext
             bytes += chunk.length;
             if (bytes > ctx.maxBytes) { throw new Error(`download exceeded the maxPdfMb limit`); }
             hash.update(chunk);
-            if (!out.write(chunk)) { await new Promise<void>(resolve => out.once('drain', resolve)); }
+            if (!out.write(chunk)) { await Promise.race([new Promise<void>(resolve => out.once('drain', resolve)), failed]); }
         }
         if (bytes === 0) { throw new Error('empty response'); }
-        await new Promise<void>((resolve, reject) => { out.on('error', reject); out.end(resolve); });
+        // `end`'s callback receives the stream error when the open failed (a directory, EACCES) — reject on it too.
+        await Promise.race([new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve()))), failed]);
         fs.renameSync(part, dest);
         const ms = Date.now() - t0;
         ctx.log.info(`downloaded ${url} → ${dest} (${(bytes / 1024 / 1024).toFixed(1)} MB in ${ms} ms)`);

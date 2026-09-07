@@ -53,4 +53,9 @@ suite('xmlLite', () => {
     test('decodeEntities leaves unknown entities alone', () => {
         assert.strictEqual(decodeEntities('x &nbsp; &amp;'), 'x &nbsp; &');
     });
+
+    test('decodeEntities leaves out-of-range and surrogate character references as written', () => {
+        assert.strictEqual(decodeEntities('&#99999999; &#x110000; &#xD800; &#x41; &#65;'), '&#99999999; &#x110000; &#xD800; A A');
+        assert.strictEqual(parseXml('<a>&#99999999;</a>').text, '&#99999999;');
+    });
 });

@@ -39,7 +39,9 @@ export function decodeEntities(s: string): string {
     return s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (whole, body: string) => {
         if (body[0] === '#') {
             const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-            return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+            // Outside Unicode or a lone surrogate: String.fromCodePoint would throw; leave the reference as written.
+            const valid = code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff);
+            return valid ? String.fromCodePoint(code) : whole;
         }
         return ENTITIES[body] ?? whole;
     });

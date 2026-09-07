@@ -35,6 +35,7 @@ import {
     SvdRef, coreFromSvdCpu,
     ArmDocKind, Dossier, DossierMiss,
 } from './core/packDocs';
+import { runTool } from './core/toolRun';
 
 /** The SVD a target is served with. */
 export type DeviceSvd =
@@ -234,13 +235,15 @@ export class PackDocsHandler {
         return this.run('read_doc_pages', args, async (log, deadline) => {
             if (!args.doc) { return 'doc is required (an id from list_target_docs or search_target_docs).'; }
             if (!args.pages) { return "pages is required, e.g. '519' or '519-521'."; }
-            let doc = this.findKnown(args.doc);
-            if (!doc) {
+            let found = this.lookupKnown(args.doc);
+            if (!found.doc && !found.ambiguous) {
                 const target = await this.resolve(args, log);
                 if ('error' in target) { return `Document '${args.doc}' is not known and the target could not be resolved: ${target.error}`; }
                 this.collect(this.hostWith(args), target);
-                doc = this.findKnown(args.doc);
+                found = this.lookupKnown(args.doc);
             }
+            if (found.ambiguous) { return this.ambiguityMessage(args.doc, found.ambiguous); }
+            const doc = found.doc;
             if (!doc) { return `No document with id '${args.doc}'. Call list_target_docs for the ids.`; }
             if (doc.source === 'web') {
                 this.store.annotate(doc);
@@ -256,6 +259,8 @@ export class PackDocsHandler {
             if (!loaded) {
                 const available = await this.extractor.available();
                 if (!available.ok) { return `${doc.id} is not indexed and cannot be extracted: ${available.detail}`; }
+                const why = this.oversize(doc);
+                if (why) { return `${doc.id} is not indexed and will not be extracted: ${why}.`; }
                 loaded = await this.store.ensure(doc, this.extractor, { timeoutMs: deadline - Date.now(), log });
             }
             const range = parsePageRange(args.pages, loaded.meta.pageCount);
@@ -289,14 +294,16 @@ export class PackDocsHandler {
                     return `url '${args.url}' is not an http(s) URL.`;
                 }
             } else {
-                doc = this.findKnown(args.doc!);
-                if (!doc) {
+                let found = this.lookupKnown(args.doc!);
+                if (!found.doc && !found.ambiguous) {
                     const target = await this.resolve(args, log);
                     if (!('error' in target)) {
                         this.collect(this.hostWith(args), target);
-                        doc = this.findKnown(args.doc!);
+                        found = this.lookupKnown(args.doc!);
                     }
                 }
+                if (found.ambiguous) { return this.ambiguityMessage(args.doc!, found.ambiguous); }
+                doc = found.doc;
                 if (!doc) {
                     const arm = parseArmDocId(args.doc!);
                     if (arm) {
@@ -407,7 +414,7 @@ export class PackDocsHandler {
         if (!coreName) { return vendor ? { kind: 'missing', rel: vendor.rel, path: vendor.path, why } : undefined; }
         const core = resolveCoreSvd(this.host.assetsDir, coreName);
         if (core?.exists) { return { kind: 'core', rel: core.file, path: core.path, source: core.source, why, summary: loadCoreSvd(core, log) }; }
-        const header = resolveCoreHeader(this.host.packRoot, coreName);
+        const header = resolveCoreHeader(target.packRoot, coreName);
         if (header?.exists) { return { kind: 'core', rel: header.file, path: header.path, source: header.pack, why, summary: loadCoreHeader(header, coreName, log) }; }
         return vendor ? { kind: 'missing', rel: vendor.rel, path: vendor.path, why } : undefined;
     }
@@ -459,7 +466,7 @@ export class PackDocsHandler {
             chosen.note,
             coreName ? `core ${coreName} → shipped SVD ${coreSvd ? `${coreSvd.file}${coreSvd.exists ? '' : ' (missing)'}` : 'none in index.json'}${this.host.assetsDir ? '' : ' (no assets directory)'}` : undefined,
         ].filter(Boolean).join('; ');
-        const coreRef = coreName && !coreSvd?.exists ? resolveCoreHeader(this.host.packRoot, coreName) : undefined;
+        const coreRef = coreName && !coreSvd?.exists ? resolveCoreHeader(target.packRoot, coreName) : undefined;
         if (dev?.kind === 'core') {
             core = undefined; // the SVD above is the core SVD
         } else if (coreSvd?.exists) {
@@ -481,7 +488,7 @@ export class PackDocsHandler {
         }
         let npu: PeripheralSetInfo | undefined;
         if (t.npus.length) {
-            const refs = t.npus.map(n => resolveNpuHeader(this.host.packRoot, n)).filter((r): r is NonNullable<typeof r> => !!r);
+            const refs = t.npus.map(n => resolveNpuHeader(target.packRoot, n)).filter((r): r is NonNullable<typeof r> => !!r);
             if (refs.length) {
                 const first = refs[0];
                 npu = { rel: refs.map(r => r.file).filter((f, i, a) => a.indexOf(f) === i).join(', '), path: first.path, exists: refs.every(r => r.exists), pack: first.pack, coreName: t.npus.join(', '), peripherals: [] };
@@ -542,7 +549,7 @@ export class PackDocsHandler {
         if (!coreName) { return undefined; }
         const svd = resolveCoreSvd(this.host.assetsDir, coreName);
         if (svd?.exists) { return loadCoreSvd(svd, log); }
-        const ref = resolveCoreHeader(this.host.packRoot, coreName);
+        const ref = resolveCoreHeader(target.packRoot, coreName);
         return ref?.exists ? loadCoreHeader(ref, coreName, log) : undefined;
     }
 
@@ -564,7 +571,7 @@ export class PackDocsHandler {
         const svdSummary = svdRef?.exists ? loadSvd(svdRef.path, log) : undefined;
         const out: SvdSummary[] = [];
         for (const n of t.npus) {
-            const ref = resolveNpuHeader(this.host.packRoot, n);
+            const ref = resolveNpuHeader(target.packRoot, n);
             if (ref?.exists) { out.push(loadNpuHeader(ref, npuBaseFromSvd(svdSummary, ref.npu) ?? 0, log)); }
         }
         return out;
@@ -585,6 +592,8 @@ export class PackDocsHandler {
 
     /** Extract + index one document that is already on disk (after an import). */
     public async indexDocument(doc: DocRef): Promise<LoadedDoc> {
+        const why = this.oversize(doc);
+        if (why) { throw new Error(why); }
         return this.store.ensure(doc, this.extractor, { timeoutMs: this.options.timeoutMs, log: prefixedLog(this.host.log, '[import]') });
     }
 
@@ -602,13 +611,19 @@ export class PackDocsHandler {
 
     // --------------------------------------------------------------- helpers
 
+    /** Why `doc` must not be extracted under the maxPdfMb setting, or undefined. */
+    private oversize(doc: DocRef): string | undefined {
+        const maxMb = this.host.settings().maxPdfMb;
+        if ((doc.sizeBytes ?? 0) <= maxMb * 1024 * 1024) { return undefined; }
+        return `${(doc.sizeBytes! / 1024 / 1024).toFixed(0)} MB exceeds maxPdfMb ${maxMb} (cmsis-developer-assistant.packDocs.maxPdfMb)`;
+    }
+
     /** Extract + index the candidates that are not cached yet, within the deadline. */
     private async ensureAll(candidates: DocRef[], log: PackDocsHost['log'], deadline: number): Promise<{ loaded: LoadedDoc[]; indexedNow: { doc: DocRef; ms: number }[]; skipped: { doc: DocRef; reason: string }[] }> {
         const available = await this.extractor.available();
         if (!available.ok && candidates.some(d => !this.store.isCurrent(d))) {
             log.warn(`extractor unavailable: ${available.detail}`);
         }
-        const maxBytes = this.host.settings().maxPdfMb * 1024 * 1024;
         const loaded: LoadedDoc[] = [];
         const indexedNow: { doc: DocRef; ms: number }[] = [];
         const skipped: { doc: DocRef; reason: string }[] = [];
@@ -618,7 +633,8 @@ export class PackDocsHandler {
                 if (l) { loaded.push(l); continue; }
             }
             if (!available.ok) { skipped.push({ doc: d, reason: `cannot extract — ${available.detail}` }); continue; }
-            if ((d.sizeBytes ?? 0) > maxBytes) { skipped.push({ doc: d, reason: `${(d.sizeBytes! / 1024 / 1024).toFixed(0)} MB exceeds maxPdfMb ${this.host.settings().maxPdfMb}` }); continue; }
+            const why = this.oversize(d);
+            if (why) { skipped.push({ doc: d, reason: why }); continue; }
             const remaining = deadline - Date.now();
             if (remaining < 2000) { skipped.push({ doc: d, reason: 'not enough time left in this call; call again' }); continue; }
             const t0 = Date.now();
@@ -674,6 +690,7 @@ export class PackDocsHandler {
     private fetchContext(log: PackDocsHost['log'], deadline: number): ResolveContext {
         return {
             fetchFn: this.host.fetchFn ?? ((url, init) => fetch(url, init)),
+            ...(this.host.allowPrivateHosts ? { allowPrivateHosts: true } : {}),
             userAgent: this.host.userAgent,
             log,
             timeoutMs: Math.max(1000, deadline - Date.now()),
@@ -690,10 +707,9 @@ export class PackDocsHandler {
         const local = docs.filter(isReadable);
         const available = await this.extractor.available();
         if (!available.ok) { return `Cannot extract: ${available.detail}`; }
-        const maxBytes = this.host.settings().maxPdfMb * 1024 * 1024;
         let done = 0, cached = 0, failed = 0;
         for (const d of local) {
-            if ((d.sizeBytes ?? 0) > maxBytes) { continue; }
+            if (this.oversize(d)) { continue; }
             progress?.(`${d.id} (${done + cached + 1}/${local.length})`);
             try {
                 const before = this.store.isCurrent(d);
@@ -708,16 +724,33 @@ export class PackDocsHandler {
     }
 
     private findKnown(id: string): DocRef | undefined {
+        return this.lookupKnown(id).doc;
+    }
+
+    /**
+     * A document by id: exact, case-insensitive, then by trailing path
+     * segment, then by substring — the last two only when one document
+     * matches; several are reported so the agent picks, instead of reading
+     * pages of whichever the map yields first.
+     */
+    private lookupKnown(id: string): { doc?: DocRef; ambiguous?: DocRef[] } {
         const exact = this.knownDocs.get(id);
-        if (exact) { return exact; }
+        if (exact) { return { doc: exact }; }
         const lower = id.toLowerCase();
         for (const [k, v] of this.knownDocs) {
-            if (k.toLowerCase() === lower) { return v; }
+            if (k.toLowerCase() === lower) { return { doc: v }; }
         }
-        for (const [k, v] of this.knownDocs) {
-            if (k.toLowerCase().endsWith(`/${lower}`) || k.toLowerCase().includes(lower)) { return v; }
-        }
-        return undefined;
+        const bySuffix = [...this.knownDocs].filter(([k]) => k.toLowerCase().endsWith(`/${lower}`)).map(([, v]) => v);
+        if (bySuffix.length === 1) { return { doc: bySuffix[0] }; }
+        if (bySuffix.length > 1) { return { ambiguous: bySuffix }; }
+        const bySubstring = [...this.knownDocs].filter(([k]) => k.toLowerCase().includes(lower)).map(([, v]) => v);
+        if (bySubstring.length === 1) { return { doc: bySubstring[0] }; }
+        if (bySubstring.length > 1) { return { ambiguous: bySubstring }; }
+        return {};
+    }
+
+    private ambiguityMessage(id: string, candidates: DocRef[]): string {
+        return `Document id '${id}' is ambiguous — it matches ${candidates.map(d => d.id).join(', ')}. Pass one of these ids.`;
     }
 
     private resolve(args: TargetArgs, log: PackDocsHost['log']): Promise<TargetResolution | { error: string }> {
@@ -734,33 +767,8 @@ export class PackDocsHandler {
         return { ...this.host, settings: () => ({ ...this.host.settings(), includeUnlisted }) };
     }
 
-    /**
-     * Timeout fence and trace for one tool call: logs the arguments, the
-     * duration and the size of the result, and turns a timeout into a
-     * message instead of a hung call.
-     */
-    private async run(tool: string, args: object, body: (log: PackDocsHost['log'], deadline: number) => Promise<string>): Promise<string> {
-        const n = ++this.callCounter;
-        const log = prefixedLog(this.host.log, `[${tool} #${n}]`);
-        const requested = (args as { timeoutMs?: number }).timeoutMs;
-        const timeoutMs = requested ? Math.min(Math.max(requested, 100), 600_000) : this.options.timeoutMs;
-        const started = Date.now();
-        log.info(`→ ${JSON.stringify(args)}`);
-        let timer: NodeJS.Timeout | undefined;
-        const timeout = new Promise<string>(resolve => {
-            timer = setTimeout(() => resolve(`${tool} timed out after ${timeoutMs} ms. ${TIMEOUT_NOTE}`), timeoutMs);
-        });
-        try {
-            const result = await Promise.race([body(log, started + timeoutMs), timeout]);
-            const ms = Date.now() - started;
-            log.info(`← ${ms} ms, ${Buffer.byteLength(result)} bytes`);
-            log.debug(`result:\n${result.split('\n').slice(0, 30).map(l => '    ' + l).join('\n')}${result.split('\n').length > 30 ? '\n    …' : ''}`);
-            return result;
-        } catch (e) {
-            log.error(`failed after ${Date.now() - started} ms`, e);
-            return `${tool} failed: ${e instanceof Error ? e.message : String(e)}`;
-        } finally {
-            if (timer) { clearTimeout(timer); }
-        }
+    /** Timeout fence and trace for one tool call — see `runTool`. */
+    private run(tool: string, args: object, body: (log: PackDocsHost['log'], deadline: number) => Promise<string>): Promise<string> {
+        return runTool(tool, ++this.callCounter, args, this.host.log, { defaultTimeoutMs: this.options.timeoutMs, timeoutNote: TIMEOUT_NOTE }, body);
     }
 }

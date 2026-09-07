@@ -39,7 +39,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { PackId } from './cbuildRun';
 import { PackDocsLog, silentLog } from './host';
-import { BookCategory, DocRef, fileSlug } from './pdscBooks';
+import { BookCategory, DocRef, fileSlug, slug } from './pdscBooks';
 
 export interface UserDocMeta {
     title?: string;
@@ -98,6 +98,18 @@ function safeName(s: string): string {
 }
 
 /** The folder a scope maps to under the root. */
+/**
+ * The id of a user document: `user/<scope folder segments>/<file>`, so the
+ * same file name attributed to two scopes (`Keil/STM32U5xx_DFP/RM0456.pdf`
+ * and a device-glob folder holding another `RM0456.pdf`) never collides,
+ * and the id does not depend on which documents happen to be listed
+ * together. A file at the root keeps `user/<file>`.
+ */
+export function userDocId(root: string, file: string): string {
+    const rel = path.relative(root, path.dirname(file)).split(path.sep).filter(seg => seg && seg !== '.');
+    return ['user', ...rel.map(slug), fileSlug(path.basename(file))].join('/');
+}
+
 export function userScopeDir(root: string, scope: UserScope): string {
     switch (scope.kind) {
         case 'all': return root;
@@ -154,7 +166,7 @@ function pdfsIn(dir: string, root: string, out: DocRef[], seen: Set<string>, dep
         let size: number | undefined;
         try { size = fs.statSync(full).size; } catch { size = undefined; }
         out.push({
-            id: `user/${fileSlug(e.name)}`,
+            id: userDocId(root, full),
             title: meta.title?.trim() || e.name.replace(/\.pdf$/i, ''),
             ...(meta.category ? { category: meta.category } : {}),
             ...(meta.revision ? { revision: meta.revision } : {}),
@@ -237,5 +249,5 @@ export function importUserDoc(root: string, scope: UserScope, file: string, meta
     };
     if (Object.keys(clean).length) { manifest[name] = { ...(manifest[name] ?? {}), ...clean }; }
     if (Object.keys(manifest).length) { writeManifest(dir, manifest); }
-    return { dest, dir, id: `user/${fileSlug(name)}`, replaced };
+    return { dest, dir, id: userDocId(root, dest), replaced };
 }

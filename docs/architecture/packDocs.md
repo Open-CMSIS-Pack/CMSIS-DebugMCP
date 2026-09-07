@@ -8,9 +8,9 @@ router the same way as the serial tool group.
 
 | Path | What | Imports `vscode`? |
 | ---- | ---- | ----------------- |
-| `src/core/packDocs/` | Target resolution from `*.cbuild-run.yml` (`cbuildRun.ts`, `targetDocs.ts`), pdsc `<book>` walking (`pdscBooks.ts`), Arm document catalogue and download (`armDocs.ts`, `webFetch.ts`), user and workspace document folders, `pdftotext` extraction (`pdfExtract.ts`), the on-disk page store and BM25 index (`pageStore.ts`, `bm25Index.ts`, `search.ts`), peripheral dossiers over the SVD (`svdLite.ts`, `coreSvd.ts`, `peripheralDocs.ts`), renderers | no — everything arrives through `PackDocsHost` (`host.ts`) |
+| `src/core/packDocs/` | Target resolution from `*.cbuild-run.yml` (`cbuildRun.ts`, `targetDocs.ts`), pdsc `<book>` walking (`pdscBooks.ts`), Arm document catalogue and download (`armDocs.ts`, `webFetch.ts`), user and workspace document folders, PDF extraction — bundled pdf.js on a worker thread, `pdftotext` optional (`pdfExtract.ts`, `pdfWorker.ts`), the on-disk page store and BM25 index (`pageStore.ts`, `bm25Index.ts`, `search.ts`), peripheral dossiers over the SVD (`svdLite.ts`, `coreSvd.ts`, `peripheralDocs.ts`), renderers | no — everything arrives through `PackDocsHost` (`host.ts`) |
 | `src/core/buildInfo/` | ELF32 reader (`elf.ts`, positioned reads, no library), GNU ld / armlink map parser (`mapFile.ts`), build-log diagnostics (`buildLog.ts`), artefact discovery from cbuild-run / cbuild files (`artifacts.ts`), region usage (`usage.ts`), renderers | no — `BuildInfoHost` |
-| `src/packDocsHandler.ts`, `src/buildInfoHandler.ts` | One `handle*` method per tool, a timeout fence per call (`timeoutMs` up to 600 s — indexing a 3 000-page manual takes minutes), traces in the output channel, panel-only inspection methods | no |
+| `src/packDocsHandler.ts`, `src/buildInfoHandler.ts` | One `handle*` method per tool, panel-only inspection methods; every call goes through the shared timeout fence and trace in `src/core/toolRun.ts` (`timeoutMs` up to 600 s — indexing a 3 000-page manual takes minutes; a call that outlives its timeout stays observed) | no |
 | `src/packDocsTools.ts`, `src/buildInfoTools.ts` | The MCP tool names and zod schemas; call the dispatch, never a handler | no |
 | `src/packDocsDispatch.ts` | `PackDocsHandlers { docs, build }`, `PackDocsDispatch`, `localPackDocsDispatch` | no |
 | `src/packDocsHost.ts` | Settings (`cmsis-developer-assistant.packDocs.*`, `.buildInfo.*`), the host objects (pack root, `globalStorage/packdocs`, `assets/`, `findFiles`), `createPackDocsHandlers` | yes |
@@ -35,7 +35,7 @@ router the same way as the serial tool group.
 
 ## Storage
 
-Extracted page text, metadata and indexes live under `<globalStorageUri>/packdocs/` — `<vendor>/<pack>/<version>/<slug>.{pages.jsonl,meta.json,idx.json}` for pack documents, `workspace/<hash>/…`, `user/<hash>/…`, `web|arm/<id>/…` for fetched ones. PDFs themselves stay where they are. The user documents folder defaults to `~/.cmsis-pack-docs/user` so documents imported with the standalone extension stay attributed.
+Extracted page text, metadata and indexes live under `<globalStorageUri>/packdocs/` — `<vendor>/<pack>/<version>/<slug>.{pages.jsonl,meta.json,idx.json}` for pack documents, `workspace/<hash>/…`, `user/<hash>/…`, `web|arm/<id>/…` for fetched ones. User-document ids carry their scope folder (`user/keil/stm32u5xx-dfp/rm0456`; `user/<name>` at the root), so a file name repeated in two scopes never collides. PDFs themselves stay where they are. The user documents folder defaults to `~/.cmsis-pack-docs/user` so documents imported with the standalone extension stay attributed.
 
 ## Tests
 
@@ -43,4 +43,4 @@ Extracted page text, metadata and indexes live under `<globalStorageUri>/packdoc
 
 ## Follow-ups
 
-Fold `svdLite.ts` (interrupts, `groupName`, flattened clusters) into `src/core/svdParser.ts`; use `core/packDocs/cbuildRun.ts` for the SVD and flash cbuild-run resolution too; drop `core/packDocs/textBudget.ts` in favour of `core/textBudget.ts`; a pdfjs extractor for hosts without poppler; turn the gates on by default once the tool-list cost is accepted.
+Fold `svdLite.ts` (interrupts, `groupName`, flattened clusters) into `src/core/svdParser.ts`; use `core/packDocs/cbuildRun.ts` for the SVD and flash cbuild-run resolution too; drop `core/packDocs/textBudget.ts` in favour of `core/textBudget.ts` (the two have diverged in their clip suffix); turn the gates on by default once the tool-list cost is accepted.

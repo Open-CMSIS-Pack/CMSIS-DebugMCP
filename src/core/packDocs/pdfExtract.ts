@@ -162,11 +162,17 @@ export class PdfjsExtractor implements PdfExtractor {
     private idleTimer?: NodeJS.Timeout;
     private availability?: { ok: boolean; detail: string };
 
-    constructor(private readonly idleMs = 60_000) { }
+    /** `entry`: the worker script; tests inject a stand-in, production finds the bundled one. */
+    constructor(private readonly idleMs = 60_000, private readonly entry?: string) { }
+
+    /** True while a worker thread is up (running a request or waiting to be retired). */
+    isRunning(): boolean {
+        return this.worker !== undefined;
+    }
 
     private spawn(): Worker {
         if (this.worker) { return this.worker; }
-        const worker = new Worker(workerEntry());
+        const worker = new Worker(this.entry ?? workerEntry());
         worker.on('message', (msg: PdfWorkerResponse) => {
             const p = this.pending.get(msg.id);
             if (!p) { return; }
