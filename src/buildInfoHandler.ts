@@ -26,9 +26,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
     BuildContext, BuildInfoHost, ElfInfo, ImageArtifacts, MapFile, MemoryRegion, SymbolHit, computeRegionUsage, findRegion, hex, inputSectionAt,
-    looksLikeBuildLog, outputSectionAt, parseMapFile, prefixedLog, readBuildLog, readElf, regionsFor, renderArtifacts, renderDiagnostics,
+    isInsideAny, looksLikeBuildLog, outputSectionAt, parseMapFile, prefixedLog, readBuildLog, readElf, regionsFor, renderArtifacts, renderDiagnostics,
     renderLayout, renderLookup, renderNoBuild, renderNoLog, renderUsage, resolveBuildContext, sectionAt, symbolAt, topSymbols, uncoveredRanges, usageRegions,
 } from './core/buildInfo';
+import { runTool } from './core/toolRun';
 
 export interface BuildInfoHandlerOptions {
     /** Default per-call timeout. */
@@ -192,8 +193,20 @@ export class BuildInfoHandler {
             let ctxLine: string | undefined;
             let candidates: string[] = [];
             if (args.file?.trim()) {
-                const file = path.isAbsolute(args.file) ? args.file : path.resolve(this.root() ?? process.cwd(), args.file);
+                // Inside the open workspace only: this tool renders lines of
+                // whatever file it is pointed at, so it must not become an
+                // arbitrary-file read for the agent.
+                const roots = [...new Set([this.root(), ...this.host.workspaceFolders()].filter((r): r is string => !!r))];
+                if (!roots.length) { return 'No workspace folder is open; `file` must be inside a workspace folder.'; }
+                const file = path.isAbsolute(args.file) ? args.file : path.resolve(roots[0], args.file);
+                if (!isInsideAny(file, roots)) {
+                    return `${args.file} is outside the workspace (${roots.map(r => this.rel(r)).join(', ')}); ` +
+                        'get_build_diagnostics reads build logs inside the open workspace only.';
+                }
                 if (!fs.existsSync(file)) { return `Log file not found: ${file}`; }
+                if (!looksLikeBuildLog(file)) {
+                    return `${this.rel(file)} does not look like a build log (no compiler, cbuild or cmake output in its first 64 kB).`;
+                }
                 candidates = [file];
             } else {
                 const ctx = await this.resolve(args, log);
@@ -297,34 +310,9 @@ export class BuildInfoHandler {
         return entries.map(e => e.file);
     }
 
-    /**
-     * Timeout fence and trace for one tool call: logs the arguments, the
-     * duration and the size of the result, and turns a timeout into a
-     * message instead of a hung call.
-     */
-    private async run(tool: string, args: object, body: (log: BuildInfoHost['log'], deadline: number) => Promise<string>): Promise<string> {
-        const n = ++this.callCounter;
-        const log = prefixedLog(this.host.log, `[${tool} #${n}]`);
-        const requested = (args as { timeoutMs?: number }).timeoutMs;
-        const timeoutMs = requested ? Math.min(Math.max(requested, 100), 600_000) : this.options.timeoutMs;
-        const started = Date.now();
-        log.info(`→ ${JSON.stringify(args)}`);
-        let timer: NodeJS.Timeout | undefined;
-        const timeout = new Promise<string>(resolve => {
-            timer = setTimeout(() => resolve(`${tool} timed out after ${timeoutMs} ms. ${TIMEOUT_NOTE}`), timeoutMs);
-        });
-        try {
-            const result = await Promise.race([body(log, started + timeoutMs), timeout]);
-            const ms = Date.now() - started;
-            log.info(`← ${ms} ms, ${Buffer.byteLength(result)} bytes`);
-            log.debug(`result:\n${result.split('\n').slice(0, 30).map(l => '    ' + l).join('\n')}${result.split('\n').length > 30 ? '\n    …' : ''}`);
-            return result;
-        } catch (e) {
-            log.error(`failed after ${Date.now() - started} ms`, e);
-            return `${tool} failed: ${e instanceof Error ? e.message : String(e)}`;
-        } finally {
-            if (timer) { clearTimeout(timer); }
-        }
+    /** Timeout fence and trace for one tool call — see `runTool`. */
+    private run(tool: string, args: object, body: (log: BuildInfoHost['log'], deadline: number) => Promise<string>): Promise<string> {
+        return runTool(tool, ++this.callCounter, args, this.host.log, { defaultTimeoutMs: this.options.timeoutMs, timeoutNote: TIMEOUT_NOTE }, body);
     }
 }
 

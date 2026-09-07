@@ -336,6 +336,20 @@ suite('BuildInfoHandler (end to end)', () => {
         assert.match(explicit, /^Status: ok — Build summary: 1 succeeded, 0 failed/m);
         assert.doesNotMatch(explicit, /^Build: target/m);
         assert.match(await handler.handleGetBuildDiagnostics({ file: 'nope.log' }), /^Log file not found/);
+        // `file` is confined to the open workspace, and must look like a build log.
+        const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'buildinfo-outside-')), 'outside.log');
+        fs.writeFileSync(outside, 'error: secret\n');
+        assert.match(await handler.handleGetBuildDiagnostics({ file: outside }), /is outside the workspace \(.*\); get_build_diagnostics reads build logs inside the open workspace only\./);
+        assert.match(await handler.handleGetBuildDiagnostics({ file: path.join('..', '..', '..', 'etc', 'passwd') }), /is outside the workspace/);
+        fs.writeFileSync(path.join(world.workspace, 'notes.txt'), 'hello\n');
+        assert.match(await handler.handleGetBuildDiagnostics({ file: 'notes.txt' }), /^notes\.txt does not look like a build log/);
+        const noRoots = new BuildInfoHandler({ ...world.host, workspaceFolders: () => [] }, { timeoutMs: 5000 });
+        assert.match(await noRoots.handleGetBuildDiagnostics({ file: outside }), /^No workspace folder is open/);
+        // A second workspace folder is inside too.
+        const other = fs.mkdtempSync(path.join(os.tmpdir(), 'buildinfo-other-'));
+        fs.copyFileSync(path.join(world.workspace, 'logs', 'build-old.log'), path.join(other, 'build.log'));
+        const twoRoots = new BuildInfoHandler({ ...world.host, workspaceFolders: () => [world.workspace, other] }, { timeoutMs: 5000, workspaceRoot: () => world.workspace });
+        assert.match(await twoRoots.handleGetBuildDiagnostics({ file: path.join(other, 'build.log') }), /^Status: ok — Build summary: 1 succeeded, 0 failed/m);
         const noLogs = new BuildInfoHandler({ ...world.host, settings: () => ({ ...defaultBuildInfoSettings, logGlobs: ['**/nothing/*.log'] }) }, { timeoutMs: 5000 });
         const none = await noLogs.handleGetBuildDiagnostics({ target: 'NUCLEO' });
         assert.match(none, /^No build log found \(searched \*\*\/nothing\/\*\.log\)\. The CMSIS Solution extension runs cbuild in a terminal and keeps no log file\. Capture one with `cbuild <solution>\.csolution\.yml --packs --update-rte --log out\/build\.log`/m);

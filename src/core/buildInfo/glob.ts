@@ -45,6 +45,31 @@ export function globToRegExp(glob: string): RegExp {
     return new RegExp(re + '$');
 }
 
+/** `path.resolve` plus the real path when it exists, so a symlink cannot point out of a root. */
+function canonical(p: string): string {
+    const resolved = path.resolve(p);
+    try {
+        return fs.realpathSync.native(resolved);
+    } catch {
+        return resolved;
+    }
+}
+
+/**
+ * True when `file` is one of `roots` or inside one (after resolving
+ * symlinks; case-insensitive on Windows). `/ws2/x` is not inside `/ws`.
+ */
+export function isInsideAny(file: string, roots: readonly string[]): boolean {
+    const fold = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const target = fold(canonical(file));
+    for (const root of roots) {
+        const base = fold(canonical(root));
+        const rel = path.relative(base, target);
+        if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) { return true; }
+    }
+    return false;
+}
+
 export function walkGlob(root: string, glob: string, maxDepth = 8): string[] {
     const re = globToRegExp(glob);
     const found: string[] = [];
