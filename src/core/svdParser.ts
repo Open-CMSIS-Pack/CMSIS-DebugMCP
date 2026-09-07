@@ -138,7 +138,7 @@ export async function resolveSvdPath(ctx: SvdResolveContext): Promise<SvdResolut
     const packRoot = typeof ctx.packRoot === 'function' ? await ctx.packRoot() : (ctx.packRoot ?? defaultPackRoot());
 
     if (ctx.svdFile) {
-        const resolved = expandPackRoot(ctx.svdFile, packRoot);
+        const resolved = path.normalize(expandPackRoot(ctx.svdFile, packRoot));
         if (fs.existsSync(resolved)) { return { path: resolved, tried }; }
         tried.push(`svdFile ${resolved} (not found)`);
     }
@@ -225,7 +225,7 @@ function findSvdInCbuildRun(filePath: string, packRoot: string, pname?: string, 
         const entries = svdEntriesFromCbuildRun(fs.readFileSync(filePath, 'utf-8'));
         const entry = selectSvdEntry(entries, pname, sessionName);
         if (!entry) { return null; }
-        const resolved = expandPackRoot(entry.file, packRoot);
+        const resolved = path.normalize(expandPackRoot(entry.file, packRoot));
         return fs.existsSync(resolved) ? resolved : null;
     } catch {
         return null;

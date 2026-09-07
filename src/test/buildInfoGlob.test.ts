@@ -37,6 +37,19 @@ suite('buildInfo isInsideAny', () => {
         assert.ok(!isInsideAny(path.join(ws, 'x.log'), []));
     });
 
+    test('a root reached through a symlinked directory still contains a file that does not exist yet', function () {
+        // macOS hands out tmpdirs under /var/folders, which realpath resolves to /private/var;
+        // Windows runners use 8.3 short names. The root canonicalises, the missing file must too.
+        if (process.platform === 'win32') { this.skip(); }
+        const real = path.join(dir, 'real-ws');
+        fs.mkdirSync(path.join(real, 'out'), { recursive: true });
+        const link = path.join(dir, 'link-ws');
+        fs.symlinkSync(real, link);
+        assert.ok(isInsideAny(path.join(link, 'nope.log'), [link]), 'missing file under the linked root');
+        assert.ok(isInsideAny(path.join(link, 'out', 'deep', 'nope.log'), [real]), 'missing nested file, root given by its real path');
+        assert.ok(isInsideAny(path.join(real, 'nope.log'), [link]), 'real path under the linked root');
+    });
+
     test('a symlink pointing out of the root is outside', function () {
         if (process.platform === 'win32') { this.skip(); }
         const ws = path.join(dir, 'ws');

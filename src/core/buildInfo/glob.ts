@@ -45,13 +45,21 @@ export function globToRegExp(glob: string): RegExp {
     return new RegExp(re + '$');
 }
 
-/** `path.resolve` plus the real path when it exists, so a symlink cannot point out of a root. */
+/**
+ * `path.resolve` plus the real path, so a symlink cannot point out of a root.
+ * A path that does not exist yet is canonicalised through its deepest
+ * existing ancestor: otherwise a root under `/var/folders` (macOS resolves it
+ * to `/private/var`) or `RUNNER~1` (a Windows short name) never matches a
+ * file resolved without `realpath`.
+ */
 function canonical(p: string): string {
     const resolved = path.resolve(p);
     try {
         return fs.realpathSync.native(resolved);
     } catch {
-        return resolved;
+        const parent = path.dirname(resolved);
+        if (parent === resolved) { return resolved; }
+        return path.join(canonical(parent), path.basename(resolved));
     }
 }
 

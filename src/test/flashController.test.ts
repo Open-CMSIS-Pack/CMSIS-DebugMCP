@@ -121,11 +121,14 @@ suite('flashWithPyocd kill escalation', () => {
         if (process.platform === 'win32') { this.skip(); }
         const spawnIgnoring = ((_cmd: string, _args: string[], opts: object) =>
             spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], opts as never)) as unknown as typeof spawn;
+        // A generous deadline: node must have started and installed the
+        // SIGTERM handler before the signal arrives (a slow CI runner takes
+        // well over 200 ms), else the default action kills it early.
         const t0 = Date.now();
-        const result = await flashWithPyocd('x.cbuild-run.yml', 200, { spawn: spawnIgnoring, killGraceMs: 300 });
+        const result = await flashWithPyocd('x.cbuild-run.yml', 2_000, { spawn: spawnIgnoring, killGraceMs: 300 });
         const elapsed = Date.now() - t0;
         assert.strictEqual(result.timedOut, true);
         assert.strictEqual(result.exitCode, null, 'died by signal, not by exit');
-        assert.ok(elapsed >= 450 && elapsed < 5000, `elapsed ${elapsed} ms`);
+        assert.ok(elapsed >= 2_250 && elapsed < 10_000, `elapsed ${elapsed} ms`);
     });
 });

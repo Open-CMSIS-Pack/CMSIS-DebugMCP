@@ -85,13 +85,16 @@ export class ControlServer {
         let size = 0;
         let refused = false;
         req.on('data', (chunk: Buffer) => {
-            if (refused) { return; }
+            if (refused) { return; } // drained, not buffered
             size += chunk.length;
             if (size > CONTROL_REQUEST_MAX_BYTES) {
+                // Answer at once and keep draining: destroying the socket
+                // while the client is still writing resets the connection
+                // (ECONNRESET on Windows) before the 413 is read.
                 refused = true;
-                res.writeHead(413, { 'Content-Type': 'application/json' });
+                chunks.length = 0;
+                res.writeHead(413, { 'Content-Type': 'application/json', 'Connection': 'close' });
                 res.end(JSON.stringify({ error: `control request above ${CONTROL_REQUEST_MAX_BYTES} bytes` }));
-                req.destroy();
                 return;
             }
             chunks.push(chunk);
