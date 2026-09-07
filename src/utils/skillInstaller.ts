@@ -26,6 +26,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { SkillCatalog, SkillCatalogEntry, SkillSource, parseSkillFrontmatter } from './skillCatalog';
+import { isProcessAlive } from './workspaceRegistry';
 
 /**
  * Written into every skill directory this extension installs. Its presence
@@ -186,6 +187,8 @@ export class SkillInstaller {
     constructor(
         private readonly extensionPath: string,
         private readonly extensionVersion: string,
+        /** Whether a pid is a live process — decides whose staging directories may be swept. Injectable for tests. */
+        private readonly isAlive: (pid: number) => boolean = isProcessAlive,
     ) {}
 
     /**
@@ -302,7 +305,12 @@ export class SkillInstaller {
         }
     }
 
-    /** Remove `.<name>.tmp-<pid>` staging directories of earlier, interrupted syncs. */
+    /**
+     * Remove `.<name>.tmp-<pid>` staging directories of earlier, interrupted
+     * syncs — but not this process's own, nor one whose process is still
+     * alive: two windows syncing the same skill at login must not delete
+     * each other's copy in flight.
+     */
     private async removeStaleStaging(root: string, name: string): Promise<void> {
         let entries: string[];
         try {
@@ -312,9 +320,14 @@ export class SkillInstaller {
         }
         const prefix = `.${name}.tmp-`;
         for (const entry of entries) {
-            if (entry.startsWith(prefix)) {
-                await fs.promises.rm(path.join(root, entry), { recursive: true, force: true }).catch(() => undefined);
+            if (!entry.startsWith(prefix)) {
+                continue;
             }
+            const pid = Number(entry.slice(prefix.length));
+            if (pid === process.pid || (Number.isInteger(pid) && this.isAlive(pid))) {
+                continue;
+            }
+            await fs.promises.rm(path.join(root, entry), { recursive: true, force: true }).catch(() => undefined);
         }
     }
 

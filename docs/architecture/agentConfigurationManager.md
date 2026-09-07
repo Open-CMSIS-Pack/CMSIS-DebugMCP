@@ -46,9 +46,13 @@ CLI, Cursor, Codex (TOML), Claude Code, Claude Desktop (stdio bridge via
 
 ### Safety rules for config files
 
-Atomic write (temp file + rename), never recreate an unparseable file, merge
-only the `cmsis-developer-assistant` key, per-agent try/catch so one failure
-does not abort the rest.
+Atomic write (temp file + rename, per-process unique temp name —
+`src/utils/atomicFile.ts`, for JSON and Codex TOML alike); JSON files are
+re-read immediately before the write and the update retried when another
+process changed the file in between (`src/utils/jsonFileRewrite.ts` —
+`~/.claude.json` is rewritten by Claude Code all the time); never recreate an
+unparseable file; merge only the `cmsis-developer-assistant` key; per-agent
+try/catch so one failure does not abort the rest.
 
 ### The skill catalog
 

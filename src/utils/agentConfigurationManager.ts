@@ -6,6 +6,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { logger } from './logger';
+import { writeFileAtomic } from './atomicFile';
+import { rewriteJsonFile } from './jsonFileRewrite';
 import {
     AI_SKILLS_ENABLED_SETTING,
     AI_SKILLS_PROMPT_SETTING,
@@ -416,17 +418,6 @@ export class AgentConfigurationManager {
     }
 
     /**
-     * Write via a temp file + rename so a crash mid-write can never leave a
-     * half-written config behind (some of these files, e.g. ~/.claude.json,
-     * hold state well beyond MCP entries).
-     */
-    private async writeFileAtomic(filePath: string, content: string): Promise<void> {
-        const tmpPath = `${filePath}.cmsis-developer-assistant.tmp`;
-        await fs.promises.writeFile(tmpPath, content, 'utf8');
-        await fs.promises.rename(tmpPath, filePath);
-    }
-
-    /**
      * Get CMSIS Developer Assistant server configuration with current port and timeout settings.
      * The Copilot CLI expects a `type: 'http'` entry with a `tools` allowlist.
      * Claude Code takes a plain `type: 'http'` entry; Claude Desktop only
@@ -491,94 +482,84 @@ export class AgentConfigurationManager {
                         tomlChanged = true;
                     }
                     if (tomlChanged) {
-                        await fs.promises.writeFile(agent.configPath, tomlContent, 'utf8');
+                        await writeFileAtomic(agent.configPath, tomlContent);
                         migrationCount++;
                         console.log(`Successfully migrated ${agent.displayName} configuration`);
                     }
                     continue;
                 }
 
-                let config: any;
-
-                try {
-                    config = JSON.parse(configContent);
-                } catch {
-                    continue; // Skip if config can't be parsed
-                }
-
+                // JSON agents: read-modify-write through rewriteJsonFile, which
+                // re-reads immediately before writing and retries when the
+                // file changed underneath (Claude Code rewrites ~/.claude.json
+                // all the time). The closure may run more than once, so it
+                // only computes; the counting happens on the outcome.
                 const fieldName = agent.mcpServerFieldName;
-                const servers = config[fieldName];
-
-                // Rename a legacy `cmsis-debugmcp` entry to the new key,
-                // carrying its settings, then operate on the new key. This is
-                // what stops the rename from orphaning a dead duplicate server
-                // in the user's home-directory agent config.
-                let renamed = false;
-                if (servers && servers[LEGACY_SERVER_KEY]) {
-                    if (!servers[SERVER_KEY]) {
-                        servers[SERVER_KEY] = servers[LEGACY_SERVER_KEY];
-                    }
-                    delete servers[LEGACY_SERVER_KEY];
-                    renamed = true;
-                }
-
-                const debugmcpConfig = servers?.[SERVER_KEY];
-
-                if (!debugmcpConfig) {
-                    if (renamed) {
-                        await this.writeFileAtomic(agent.configPath, JSON.stringify(config, null, 2));
-                        migrationCount++;
-                    }
-                    continue; // server not configured for this agent
-                }
-
-                // Migrate only when the existing entry doesn't match the
-                // transport this agent should use: legacy /sse endpoints, or
-                // a transport type that differs from the desired one. For
-                // agents whose correct type IS 'http' (Copilot CLI, Claude
-                // Code) an 'http' entry is current, not legacy.
                 const desiredConfig = this.getDebugMCPConfig(agent);
-                const isLegacySse =
-                    debugmcpConfig.type === 'sse' ||
-                    (typeof debugmcpConfig.url === 'string' && debugmcpConfig.url.endsWith('/sse'));
-                const isWrongTransport =
-                    desiredConfig.type !== undefined &&
-                    debugmcpConfig.type !== undefined &&
-                    debugmcpConfig.type !== desiredConfig.type;
-                // A stale endpoint (e.g. the server fell back to an
-                // OS-assigned port) is refreshed silently — the entry would
-                // otherwise point at a dead port.
-                const isStaleEndpoint =
-                    (typeof debugmcpConfig.url === 'string' &&
-                        desiredConfig.url !== undefined &&
-                        debugmcpConfig.url !== desiredConfig.url) ||
-                    (Array.isArray(debugmcpConfig.args) &&
-                        desiredConfig.args !== undefined &&
-                        JSON.stringify(debugmcpConfig.args) !== JSON.stringify(desiredConfig.args));
-                const needsMigration = isLegacySse || isWrongTransport || isStaleEndpoint;
+                let renamed = false;
+                let countsAsMigration = false;
+                const outcome = await rewriteJsonFile(agent.configPath, (config) => {
+                    renamed = false;
+                    countsAsMigration = false;
+                    const servers = config[fieldName] as Record<string, any> | undefined;
 
-                if (needsMigration || renamed) {
+                    // Rename a legacy `cmsis-debugmcp` entry to the new key,
+                    // carrying its settings, then operate on the new key. This is
+                    // what stops the rename from orphaning a dead duplicate server
+                    // in the user's home-directory agent config.
+                    if (servers && servers[LEGACY_SERVER_KEY]) {
+                        if (!servers[SERVER_KEY]) {
+                            servers[SERVER_KEY] = servers[LEGACY_SERVER_KEY];
+                        }
+                        delete servers[LEGACY_SERVER_KEY];
+                        renamed = true;
+                    }
+
+                    const debugmcpConfig = servers?.[SERVER_KEY];
+                    if (!debugmcpConfig) {
+                        countsAsMigration = renamed;
+                        return renamed; // server not configured for this agent
+                    }
+
+                    // Migrate only when the existing entry doesn't match the
+                    // transport this agent should use: legacy /sse endpoints, or
+                    // a transport type that differs from the desired one. For
+                    // agents whose correct type IS 'http' (Copilot CLI, Claude
+                    // Code) an 'http' entry is current, not legacy.
+                    const isLegacySse =
+                        debugmcpConfig.type === 'sse' ||
+                        (typeof debugmcpConfig.url === 'string' && debugmcpConfig.url.endsWith('/sse'));
+                    const isWrongTransport =
+                        desiredConfig.type !== undefined &&
+                        debugmcpConfig.type !== undefined &&
+                        debugmcpConfig.type !== desiredConfig.type;
+                    // A stale endpoint (e.g. the server fell back to an
+                    // OS-assigned port) is refreshed silently — the entry would
+                    // otherwise point at a dead port.
+                    const isStaleEndpoint =
+                        (typeof debugmcpConfig.url === 'string' &&
+                            desiredConfig.url !== undefined &&
+                            debugmcpConfig.url !== desiredConfig.url) ||
+                        (Array.isArray(debugmcpConfig.args) &&
+                            desiredConfig.args !== undefined &&
+                            JSON.stringify(debugmcpConfig.args) !== JSON.stringify(desiredConfig.args));
+                    const needsMigration = isLegacySse || isWrongTransport || isStaleEndpoint;
+
                     if (needsMigration) {
-                        console.log(`Migrating server configuration for ${agent.displayName} to the ${desiredConfig.type ?? 'stdio-bridge'} transport`);
-
                         // Update to new configuration
-                        config[fieldName][SERVER_KEY] = desiredConfig;
-
+                        (config[fieldName] as Record<string, any>)[SERVER_KEY] = { ...desiredConfig };
                         // Preserve any custom autoApprove settings
                         if (debugmcpConfig.autoApprove && Array.isArray(debugmcpConfig.autoApprove)) {
-                            config[fieldName][SERVER_KEY].autoApprove = debugmcpConfig.autoApprove;
+                            (config[fieldName] as Record<string, any>)[SERVER_KEY].autoApprove = debugmcpConfig.autoApprove;
                         }
                     }
-
-                    // Write the migrated config
-                    await this.writeFileAtomic(
-                        agent.configPath,
-                        JSON.stringify(config, null, 2)
-                    );
-
                     // Count legacy-transport migrations and key renames toward
                     // the user-facing toast; silent endpoint refreshes don't.
-                    if (isLegacySse || isWrongTransport || renamed) {
+                    countsAsMigration = isLegacySse || isWrongTransport || renamed;
+                    return needsMigration || renamed;
+                });
+                if (outcome === 'written') {
+                    if (countsAsMigration) {
                         migrationCount++;
                     }
                     console.log(`Successfully migrated ${agent.displayName} configuration`);
@@ -638,27 +619,24 @@ export class AgentConfigurationManager {
                 const existing = fs.existsSync(agent.configPath)
                     ? await fs.promises.readFile(agent.configPath, 'utf8')
                     : '';
-                await fs.promises.writeFile(
-                    agent.configPath,
-                    upsertCodexDebugMCPConfig(existing, this.getMCPServerUrl()),
-                    'utf8'
-                );
+                await writeFileAtomic(agent.configPath, upsertCodexDebugMCPConfig(existing, this.getMCPServerUrl()));
                 console.log(`Successfully added CMSIS Developer Assistant configuration to ${agent.name}`);
                 return true;
             }
 
-            let config: any = {};
-
-            // Read existing config if it exists
+            const fieldName = agent.mcpServerFieldName;
+            const desired = this.getDebugMCPConfig(agent);
             if (fs.existsSync(agent.configPath)) {
-                const configContent = await fs.promises.readFile(agent.configPath, 'utf8');
-                try {
-                    config = JSON.parse(configContent);
-                } catch (parseError) {
-                    // Never recreate an unparseable config — files like
-                    // ~/.claude.json hold far more than MCP entries, and
-                    // replacing them with a fresh object would destroy the
-                    // user's state. Bail out and let the user fix the file.
+                // Re-read before write, retried if the file changes underneath
+                // — never recreate an unparseable config: files like
+                // ~/.claude.json hold far more than MCP entries, and replacing
+                // them with a fresh object would destroy the user's state.
+                const outcome = await rewriteJsonFile(agent.configPath, (config) => {
+                    const servers = (config[fieldName] ??= {}) as Record<string, unknown>;
+                    servers[SERVER_KEY] = desired;
+                    return true;
+                });
+                if (outcome === 'unparseable') {
                     console.error(`Existing config for ${agent.name} is not valid JSON — refusing to overwrite it`);
                     vscode.window.showErrorMessage(
                         `Cannot configure ${agent.displayName}: ${agent.configPath} exists but is not valid JSON. ` +
@@ -666,22 +644,9 @@ export class AgentConfigurationManager {
                     );
                     return false;
                 }
+            } else {
+                await writeFileAtomic(agent.configPath, JSON.stringify({ [fieldName]: { [SERVER_KEY]: desired } }, null, 2));
             }
-
-            // Ensure the correct MCP servers object exists for this agent
-            const fieldName = agent.mcpServerFieldName;
-            if (!config[fieldName]) {
-                config[fieldName] = {};
-            }
-
-            // Add or update the server configuration with current settings
-            config[fieldName][SERVER_KEY] = this.getDebugMCPConfig(agent);
-
-            // Write the updated config back to file
-            await this.writeFileAtomic(
-                agent.configPath,
-                JSON.stringify(config, null, 2)
-            );
 
             console.log(`Successfully added CMSIS Developer Assistant configuration to ${agent.name}`);
             return true;

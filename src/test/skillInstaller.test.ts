@@ -63,7 +63,8 @@ suite('Agent skill installer', () => {
     };
 
     const homeRoots = () => ({ install: [rootA, rootB], sweepOnly: [] });
-    const installer = (): SkillInstaller => new SkillInstaller(extensionPath, '9.9.9');
+    // No pid is alive as far as the installer knows, so staging of the fixture pids is always sweepable.
+    const installer = (isAlive: (pid: number) => boolean = () => false): SkillInstaller => new SkillInstaller(extensionPath, '9.9.9', isAlive);
 
     const readMarker = (root: string, name: string): SkillMarker =>
         JSON.parse(fs.readFileSync(path.join(root, name, SKILL_MARKER_FILE), 'utf8'));
@@ -239,6 +240,17 @@ suite('Agent skill installer', () => {
         assert.ok(!fs.existsSync(path.join(rootA, '.gen.tmp-67890')));
         assert.ok(fs.existsSync(path.join(rootA, '.other.tmp-1')));
         assert.ok(fs.existsSync(path.join(rootA, 'gen', SKILL_MARKER_FILE)));
+    });
+
+    test('staging of a window that is still syncing is left alone', async () => {
+        writeSkill(path.join(rootA, '.gen.tmp-12345'), 'gen');
+        writeSkill(path.join(rootA, '.gen.tmp-67890'), 'gen');
+        writeSkill(path.join(rootA, `.gen.tmp-${process.pid}`), 'gen'); // this process's own (a re-entrant sync)
+        const report = await installer(pid => pid === 12345).sync(homeRoots(), catalog, ['gen'], []);
+        assert.ok(fs.existsSync(path.join(rootA, '.gen.tmp-12345')), 'a live peer keeps its staging');
+        assert.ok(!fs.existsSync(path.join(rootA, '.gen.tmp-67890')), 'a dead pid is swept');
+        assert.ok(fs.existsSync(path.join(rootA, 'gen', SKILL_MARKER_FILE)));
+        assert.deepStrictEqual(report.failed, []);
     });
 
     test('a project without a selection is only swept: its roots are never created', async () => {
