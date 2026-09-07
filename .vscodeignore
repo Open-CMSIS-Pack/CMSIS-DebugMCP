@@ -57,3 +57,6 @@ coverage/**
 # Design notes and licence inputs stay in the repo; only docs/agent-resources is read at runtime (MCP resources).
 docs/**
 !docs/agent-resources/**
+
+# personal scratch notes
+notes.md

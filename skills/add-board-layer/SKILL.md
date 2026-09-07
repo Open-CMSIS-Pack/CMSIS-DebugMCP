@@ -80,8 +80,9 @@ and Dname suffixes are lookups (§2/§3), never multiple-choice questions.
 
 ## 2. Resolve the board and device identity — from the pdsc, never by guess
 
-Pack root: `$CMSIS_PACK_ROOT` (default `~/.cache/arm/packs`). Install missing
-packs with `cpackget add Vendor::Pack` or `cbuild --packs`.
+Pack root: `$CMSIS_PACK_ROOT` (default `~/.cache/arm/packs` on Linux and macOS,
+`%LOCALAPPDATA%\Arm\Packs` on Windows). Install missing packs with
+`cpackget add Vendor::Pack` or `cbuild --packs`.
 
 - Device `Dname`: `grep -oE '<device Dname="[^"]*"' <DFP>.pdsc` — pick the exact
   suffix variant (`STM32H7B3LIHxQ`, not `…I6Q`).

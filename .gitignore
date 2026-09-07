@@ -429,6 +429,16 @@ coverage/*
 # agent evaluation runs (scripts/eval-scenario.ts)
 test/eval/.work/
 test/eval/reports/
+# cbuild output in the agent-evaluation fixture (built locally, never vendored)
+test/eval/fixtures/corstone-blinky/.cmsis/
+test/eval/fixtures/corstone-blinky/build/
+test/eval/fixtures/corstone-blinky/**/RTE/
+test/eval/fixtures/corstone-blinky/*.cbuild-idx.yml
+test/eval/fixtures/corstone-blinky/*.cbuild-pack.yml
+test/eval/fixtures/corstone-blinky/**/*.cbuild.yml
+test/eval/fixtures/corstone-blinky/**/*.cbuild-run.yml
+# personal scratch notes
+/notes.md
 # macOS Finder metadata
 .DS_Store
 
@@ -437,3 +447,6 @@ test/eval/reports/
 !src/core/buildInfo/buildLog.ts
 !src/test/fixtures/buildinfo/*.log
 !src/test/fixtures/packdocs/arm/
+
+# Build output (upstream stopped tracking dist/ on 2026-09-03; npm run build regenerates it)
+dist/
